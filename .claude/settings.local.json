@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& \"D:\\\\AQA\\\\URL_Converter\\\\.venv\\\\Scripts\\\\python.exe\" -m PyInstaller --version 2>&1)",
+      "PowerShell(& \"D:\\\\AQA\\\\URL_Converter\\\\.venv\\\\Scripts\\\\python.exe\" -c \"from PIL import Image; print\\('OK'\\)\" 2>&1)",
+      "Bash(Get-Content \"C:\\\\Users\\\\VITALI~1.KUZ\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\D--AQA-URL-Converter\\\\f452beaf-7ff9-4935-9065-5a069b51de25\\\\tasks\\\\bgmcvqcgt.output\" -Wait)",
+      "Bash(Select-String -Pattern \"Building|completed|ERROR|error|successfully|EXE|WARNING|Traceback\" --line-buffered)",
+      "PowerShell(Test-Path \"D:\\\\AQA\\\\URL_Converter\\\\Versions\\\\getRequest Vitalii converter.exe\"; \\(Get-Item \"D:\\\\AQA\\\\URL_Converter\\\\Versions\\\\getRequest Vitalii converter.exe\"\\).Length / 1MB)",
+      "PowerShell(cmd /c \"dir /a /s \"\"D:\\\\AQA\\\\URL_Converter\\\\Versions\"\"\")",
+      "PowerShell(cmd /c \"dir \"\"D:\\\\AQA\\\\URL_Converter\"\" /a\")",
+      "PowerShell(cmd /c \"dir \"\"D:\\\\AQA\\\\URL_Converter\\\\OLD_Versions\"\"\")",
+      "PowerShell(cmd /c \"dir /a \"\"D:\\\\AQA\\\\URL_Converter\\\\temp\"\"\")",
+      "PowerShell(.venv\\\\Scripts\\\\python.exe main.py)",
+      "PowerShell(Get-ChildItem \"D:\\\\AQA\\\\URL_Converter\" -File | Where-Object { $_.Extension -match \"\\\\.\\(png|svg|jpg|jpeg|gif|bmp\\)\" })",
+      "PowerShell($bytes = [System.IO.File]::ReadAllBytes\\(\"D:\\\\AQA\\\\URL_Converter\\\\informer.gif\"\\) | Select-Object -First 12; [System.Text.Encoding]::ASCII.GetString\\($bytes\\))",
+      "PowerShell(Get-ChildItem \"D:\\\\AQA\\\\URL_Converter\\\\\" -File | Where-Object { $_.Extension -match \"\\\\.\\(gif|png|mp4|webp\\)\" } | Select-Object Name, Length)",
+      "PowerShell($path = \"D:\\\\AQA\\\\URL_Converter\\\\instruction.gif\"; $bytes = [System.IO.File]::ReadAllBytes\\($path\\) | Select-Object -First 6; -join \\($bytes | ForEach-Object { [char]$_ }\\))",
+      "PowerShell(Set-Location \"D:\\\\AQA\\\\URL_Converter\"; \\(Get-ChildItem -File\\).Name)",
+      "PowerShell(Out-Null *)",
+      "PowerShell(Set-Location \"D:\\\\AQA\\\\URL_Converter\"; \\(Get-ChildItem -File\\).Name; Write-Host \"---\"; \\(Get-ChildItem -Directory\\).Name)",
+      "PowerShell(New-Item *)",
+      "PowerShell(Set-Location \"D:\\\\AQA\\\\URL_Converter\"; \\(Get-ChildItem -File\\).Name; Write-Host \"---dirs:\"; \\(Get-ChildItem -Directory\\).Name; Write-Host \"---assets:\"; \\(Get-ChildItem \"assets\" -File\\).Name; Write-Host \"---tools:\"; \\(Get-ChildItem \"tools\" -File\\).Name)",
+      "PowerShell(Rename-Item *)",
+      "PowerShell(Get-ChildItem \"D:\\\\AQA\\\\URL_Converter\\\\dist\\\\\" | ForEach-Object { \"$\\($_.Name\\) - $\\($_.Length\\) bytes\" })",
+      "PowerShell(Move-Item *)",
+      "PowerShell(upx *)"
+    ]
+  }
+}

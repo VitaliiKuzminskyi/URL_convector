@@ -1,238 +1,179 @@
-# main.py
-
 import sys
 import os
 import re
 import urllib.parse
 
 from PySide6.QtWidgets import (
-    QApplication,
-    QWidget,
-    QVBoxLayout,
-    QLabel,
-    QTextEdit,
-    QPushButton,
-    QMessageBox,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QTextEdit, QPushButton, QMessageBox,
 )
+from PySide6.QtGui import QFont, QIcon, QPixmap, QMovie, QPainter, QColor
+from PySide6.QtCore import Qt, Signal
 
-from PySide6.QtGui import (
-    QFont,
-    QIcon,
-)
-
-
-# ==========================================
-# RESOURCE PATH
-# Needed for PyInstaller --onefile
-# ==========================================
 
 def resource_path(relative_path):
-
     try:
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
-
     return os.path.join(base_path, relative_path)
 
 
-# ==========================================
-# MULTIPART PARSER
-# ==========================================
-
-def parse_multipart(data_raw: str):
-
-    result = {}
-
-    pattern = r'name="([^"]+)"\\r\\n\\r\\n(.*?)\\r\\n'
-
+def parse_multipart(body: str) -> dict:
     matches = re.findall(
-        pattern,
-        data_raw,
-        re.DOTALL
+        r'name="([^"]+)"\\r\\n\\r\\n(.*?)\\r\\n',
+        body,
+        re.DOTALL,
     )
-
-    for key, value in matches:
-
-        value = value.strip()
-
-        result[key] = value
-
-    return result
+    return {key: value.strip() for key, value in matches}
 
 
-# ==========================================
-# CURL -> URL
-# ==========================================
+def convert_to_url(text: str) -> str:
+    text = text.strip()
 
-def curl_to_url(curl_text: str):
-
-    # URL
-    url_match = re.search(
-        r"curl '([^']+)'",
-        curl_text
-    )
-
+    url_match = re.search(r"curl '([^']+)'", text)
     if not url_match:
-        raise ValueError(
-            "Cannot find URL inside cURL"
-        )
+        raise ValueError("It's not cURL (bash) type URL.\n\nPaste cURL (bash) type URL from DevTools please.")
 
     base_url = url_match.group(1)
 
-    # BODY
-    data_match = re.search(
-        r"--data-raw \$'(.*?)'",
-        curl_text,
-        re.DOTALL
-    )
+    data_match = re.search(r"--data-raw \$'(.*?)'", text, re.DOTALL)
+    if not data_match:
+        data_match = re.search(r"--data-raw '(.*?)'", text, re.DOTALL)
 
-    params = {}
-
-    if data_match:
-
-        raw_data = data_match.group(1)
-
-        params = parse_multipart(
-            raw_data
-        )
-
+    params = parse_multipart(data_match.group(1)) if data_match else {}
     query = urllib.parse.urlencode(params)
-
-    if query:
-        return f"{base_url}?{query}"
-
-    return base_url
+    return f"{base_url}?{query}" if query else base_url
 
 
-# ==========================================
-# MAIN WINDOW
-# ==========================================
+class ClickableLabel(QLabel):
+    clicked = Signal()
 
-class CurlConverter(QWidget):
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+
+
+class GifOverlay(QWidget):
+
+    def __init__(self, gif_path, parent):
+        super().__init__(parent)
+        self.setGeometry(parent.rect())
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self.movie = QMovie(gif_path)
+
+        self.gif_label = QLabel(self)
+        self.gif_label.setStyleSheet("background: transparent;")
+        self.gif_label.setMovie(self.movie)
+        self.movie.frameChanged.connect(self._on_first_frame)
+        self.movie.start()
+
+        self.show()
+        self.raise_()
+        self.gif_label.show()
+
+    def _on_first_frame(self):
+        size = self.movie.currentPixmap().size()
+        if size.isEmpty():
+            return
+        max_w, max_h = self.width() - 20, self.height() - 20
+        if size.width() > max_w or size.height() > max_h:
+            size = size.scaled(max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio)
+            self.movie.setScaledSize(size)
+        self.gif_label.resize(size)
+        self.gif_label.move(
+            (self.width() - size.width()) // 2,
+            (self.height() - size.height()) // 2,
+        )
+        self.movie.frameChanged.disconnect(self._on_first_frame)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 150))
+
+    def mousePressEvent(self, event):
+        self.movie.stop()
+        self.deleteLater()
+
+
+class ConverterWindow(QWidget):
 
     def __init__(self):
-
         super().__init__()
-
-        self.setWindowTitle(
-            "cURL (Bash) → getRequest Vitalii`s converter"
-        )
-
-        self.resize(1100, 750)
+        self.setWindowTitle("cURL (bash) → GET request converter v1.0.3")
+        self.resize(550, 375)
 
         layout = QVBoxLayout()
 
-        # TITLE
-        title = QLabel(
-            "Paste cURL (bash) from DevTools here"
-        )
+        title_row = QHBoxLayout()
 
-        title.setFont(
-            QFont("Segoe UI", 14)
-        )
+        title = QLabel("Paste cURL (bash) type from DevTools")
+        title.setFont(QFont("Segoe UI", 14))
+        title_row.addWidget(title)
 
-        layout.addWidget(title)
+        info_icon = ClickableLabel()
+        info_pixmap = QPixmap(resource_path("resources/info.png"))
+        info_icon.setPixmap(info_pixmap.scaledToHeight(20, Qt.TransformationMode.SmoothTransformation))
+        info_icon.setToolTip("Click it to see instructions")
+        info_icon.clicked.connect(self.show_instructions)
+        title_row.addWidget(info_icon)
+        title_row.addStretch()
 
-        # INPUT
+        layout.addLayout(title_row)
+
         self.input_box = QTextEdit()
-
-        self.input_box.setPlaceholderText(
-            "Paste Copy as cURL (bash) here..."
-        )
-
+        self.input_box.setPlaceholderText("Paste cURL (bash) type here...")
         layout.addWidget(self.input_box)
 
-        # CONVERT BUTTON
-        convert_btn = QPushButton(
-            "Convert to URL"
+        convert_btn = QPushButton("Convert to GET request")
+        convert_btn.setStyleSheet(
+            "QPushButton { background-color: #a3ffb5; }"
+            "QPushButton:hover { background-color: #85e89a; }"
+            "QPushButton:pressed { background-color: #63cc7a; }"
         )
-
-        convert_btn.clicked.connect(
-            self.convert
-        )
-
+        convert_btn.clicked.connect(self.on_convert)
         layout.addWidget(convert_btn)
 
-        # OUTPUT TITLE
-        output_title = QLabel(
-            "Converted URL"
-        )
-
-        output_title.setFont(
-            QFont("Segoe UI", 14)
-        )
-
+        output_title = QLabel("Converted URL")
+        output_title.setFont(QFont("Segoe UI", 14))
         layout.addWidget(output_title)
 
-        # OUTPUT
         self.output_box = QTextEdit()
-
         self.output_box.setReadOnly(True)
-
         layout.addWidget(self.output_box)
 
-        # COPY BUTTON
-        copy_btn = QPushButton(
-            "Copy Result"
+        copy_btn = QPushButton("Copy GET request")
+        copy_btn.setStyleSheet(
+            "QPushButton { background-color: #f0f2af; }"
+            "QPushButton:hover { background-color: #d8da8e; }"
+            "QPushButton:pressed { background-color: #c0c270; }"
         )
-
-        copy_btn.clicked.connect(
-            self.copy_result
-        )
-
+        copy_btn.clicked.connect(self.copy_result)
         layout.addWidget(copy_btn)
 
         self.setLayout(layout)
 
-    # ======================================
+    def show_instructions(self):
+        GifOverlay(resource_path("resources/info.gif"), self)
 
-    def convert(self):
-
-        curl_text = self.input_box.toPlainText()
-
+    def on_convert(self):
         try:
-
-            result = curl_to_url(
-                curl_text
-            )
-
-            self.output_box.setPlainText(
-                result
-            )
-
+            result = convert_to_url(self.input_box.toPlainText())
+            self.output_box.setPlainText(result)
         except Exception as e:
-
-            QMessageBox.critical(
-                self,
-                "Error",
-                str(e)
-            )
-
-    # ======================================
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("Error")
+            msg.setText("<center>" + str(e).replace("\n", "<br>") + "</center>")
+            msg.exec()
 
     def copy_result(self):
+        QApplication.clipboard().setText(self.output_box.toPlainText())
 
-        QApplication.clipboard().setText(
-            self.output_box.toPlainText()
-        )
-
-
-# ==========================================
-# APP START
-# ==========================================
 
 if __name__ == "__main__":
-
     app = QApplication(sys.argv)
-
-    # WINDOW ICON
-    app.setWindowIcon(
-        QIcon(resource_path("icon.ico"))
-    )
-
-    window = CurlConverter()
-
+    app.setWindowIcon(QIcon(resource_path("resources/icon.ico")))
+    window = ConverterWindow()
     window.show()
-
     sys.exit(app.exec())
