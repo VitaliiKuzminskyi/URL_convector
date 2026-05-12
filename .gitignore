@@ -1,0 +1,73 @@
+# =====================================================================
+# .gitignore for URL Converter (Python desktop + HTML web)
+# =====================================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Distribution / packaging
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+*.manifest
+
+# Virtual environments (Python)
+.venv/
+venv/
+env/
+ENV/
+
+# --- PyInstaller ---
+# Build artifacts — re-generated on each build
+build/
+dist/
+*.spec.bak
+
+# --- IDE / Editors ---
+# JetBrains (PyCharm, IntelliJ)
+.idea/
+
+# VS Code
+.vscode/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# --- OS junk ---
+# Windows
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+._*
+
+# Linux
+*~
+.directory
+
+# --- Logs / temp ---
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.orig
+
+# --- Project-specific ---
+# Built .exe files (keep source, not binaries)
+# Comment this out if you want to commit release .exe files
+# *.exe
+
+# Local Claude/Cowork session state (if any)
+.claude/sessions/
