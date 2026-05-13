@@ -20,12 +20,26 @@ def resource_path(relative_path):
 
 
 def parse_multipart(body: str) -> dict:
+    """Parse multipart/form-data body (matches name="..."\\r\\n\\r\\nvalue\\r\\n)."""
     matches = re.findall(
         r'name="([^"]+)"\\r\\n\\r\\n(.*?)\\r\\n',
         body,
         re.DOTALL,
     )
     return {key: value.strip() for key, value in matches}
+
+
+def parse_url_encoded(body: str) -> dict:
+    """Parse application/x-www-form-urlencoded body like 'a=1&b=2'."""
+    return dict(urllib.parse.parse_qsl(body, keep_blank_values=True))
+
+
+def parse_body(body: str) -> dict:
+    """Auto-detect body format: try multipart first, fall back to URL-encoded."""
+    params = parse_multipart(body)
+    if params:
+        return params
+    return parse_url_encoded(body)
 
 
 def convert_to_url(text: str) -> str:
@@ -41,9 +55,13 @@ def convert_to_url(text: str) -> str:
     if not data_match:
         data_match = re.search(r"--data-raw '(.*?)'", text, re.DOTALL)
 
-    params = parse_multipart(data_match.group(1)) if data_match else {}
+    params = parse_body(data_match.group(1)) if data_match else {}
     query = urllib.parse.urlencode(params)
-    return f"{base_url}?{query}" if query else base_url
+
+    if not query:
+        return base_url
+    separator = "&" if "?" in base_url else "?"
+    return f"{base_url}{separator}{query}"
 
 
 class ClickableLabel(QLabel):
@@ -100,7 +118,7 @@ class ConverterWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("cURL (bash) → GET request converter v1.1.0")
+        self.setWindowTitle("cURL (bash) → GET request converter v1.1.1")
         self.resize(550, 375)
 
         layout = QVBoxLayout()
