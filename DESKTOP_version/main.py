@@ -2,6 +2,7 @@ import sys
 import os
 import re
 import json
+import time
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -162,6 +163,90 @@ class JsonResponseEdit(QTextEdit):
         # JSON style: don't wrap long lines; let the user scroll horizontally
         self.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+
+class ExpandableLineEdit(QPlainTextEdit):
+    """A QPlainTextEdit styled to look like a single-line QLineEdit by default
+    (fixed 1-line height, no wrap, horizontal scroll). On double-click it
+    expands vertically to fit the full text with word-wrap-anywhere (so long
+    URL-encoded values stay readable). Focus-out collapses it back. Enter and
+    Esc both commit (clearFocus) and don't insert newlines.
+
+    Exposes `.text()` / `.setText()` aliases so call sites built for QLineEdit
+    work without changes."""
+
+    DEFAULT_HEIGHT = 34  # 1 line + padding for Consolas 10pt
+    MAX_EXPANDED_HEIGHT = 240  # cap so a giant URL doesn't dominate the panel
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFont(QFont("Consolas", 10))
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        # No horizontal scrollbar in collapsed state — overflow is silently
+        # clipped on the right; user double-clicks to expand & see the rest.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setTabChangesFocus(True)
+        self.setFixedHeight(self.DEFAULT_HEIGHT)
+        self._expanded = False
+
+    # --- QLineEdit-compatible aliases (so existing code keeps working) ---
+    def text(self) -> str:
+        return self.toPlainText()
+
+    def setText(self, txt: str) -> None:
+        # Avoid spurious textChanged when value is unchanged
+        if self.toPlainText() != txt:
+            self.setPlainText(txt)
+
+    # --- expand on double-click, collapse on focus-out ---
+    def mouseDoubleClickEvent(self, event):
+        self._expand()
+        super().mouseDoubleClickEvent(event)
+
+    def focusOutEvent(self, event):
+        self._collapse()
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event):
+        # Enter / Esc — commit (no newline insertion)
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            event.accept()
+            self.clearFocus()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            event.accept()
+            self.clearFocus()
+            return
+        super().keyPressEvent(event)
+
+    def _expand(self):
+        if self._expanded:
+            return
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        fm = self.fontMetrics()
+        text = self.toPlainText()
+        w = max(self.viewport().width() - 10, 50)
+        flags = int(Qt.TextFlag.TextWordWrap) | int(Qt.TextFlag.TextWrapAnywhere)
+        rect = fm.boundingRect(0, 0, w, 10000, flags, text)
+        needed = min(rect.height() + 18, self.MAX_EXPANDED_HEIGHT)
+        self.setFixedHeight(max(self.DEFAULT_HEIGHT, needed))
+        self._expanded = True
+
+    def _collapse(self):
+        if not self._expanded:
+            return
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFixedHeight(self.DEFAULT_HEIGHT)
+        self._expanded = False
 
 
 class MultiLineEditDelegate(QStyledItemDelegate):
@@ -372,10 +457,13 @@ class ParamsTable(QTableWidget):
 
 class HttpWorker(QObject):
     """Performs HTTP GET in a background thread, emits result via signals.
-    Always emits exactly one of `finished` or `failed`, even on unexpected errors."""
+    Always emits exactly one of `finished` or `failed`, even on unexpected errors.
+    Reports elapsed_ms and size_bytes alongside the response for UI display."""
 
-    finished = Signal(int, str, str)  # status_code, reason, body
-    failed = Signal(str)               # error message
+    # code, reason, body, elapsed_ms, size_bytes
+    finished = Signal(int, str, str, float, int)
+    # error_message, elapsed_ms
+    failed = Signal(str, float)
 
     REQUEST_TIMEOUT_SEC = 10
 
@@ -384,33 +472,41 @@ class HttpWorker(QObject):
         self.url = url
 
     def run(self):
+        t0 = time.monotonic()
         try:
             req = urllib.request.Request(self.url, method="GET")
             try:
                 with urllib.request.urlopen(req, timeout=self.REQUEST_TIMEOUT_SEC) as resp:
                     status = int(resp.status)
                     reason = str(resp.reason or "")
-                    body = resp.read().decode("utf-8", errors="replace")
-                self.finished.emit(status, reason, body)
+                    raw = resp.read()
+                    body = raw.decode("utf-8", errors="replace")
+                elapsed_ms = (time.monotonic() - t0) * 1000.0
+                self.finished.emit(status, reason, body, elapsed_ms, len(raw))
                 return
             except urllib.error.HTTPError as e:
                 # 4xx / 5xx — server responded with an error; we still want the body
                 try:
-                    body = e.read().decode("utf-8", errors="replace")
+                    raw = e.read()
+                    body = raw.decode("utf-8", errors="replace")
                 except Exception:
+                    raw = b""
                     body = ""
-                self.finished.emit(int(e.code), str(e.reason or ""), body)
+                elapsed_ms = (time.monotonic() - t0) * 1000.0
+                self.finished.emit(int(e.code), str(e.reason or ""), body, elapsed_ms, len(raw))
                 return
             except urllib.error.URLError as e:
+                elapsed_ms = (time.monotonic() - t0) * 1000.0
                 reason = e.reason
                 cls_name = type(reason).__name__
                 if cls_name in ("timeout", "TimeoutError"):
-                    self.failed.emit(f"Network Error: timed out after {self.REQUEST_TIMEOUT_SEC}s")
+                    self.failed.emit(f"Network Error: timed out after {self.REQUEST_TIMEOUT_SEC}s", elapsed_ms)
                 else:
-                    self.failed.emit(f"Network Error: {reason}")
+                    self.failed.emit(f"Network Error: {reason}", elapsed_ms)
                 return
         except Exception as e:
-            self.failed.emit(f"Error: {type(e).__name__}: {e}")
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            self.failed.emit(f"Error: {type(e).__name__}: {e}", elapsed_ms)
 
 
 # ============================================================
@@ -437,7 +533,7 @@ class ConverterWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("cURL (bash) → GET request converter v1.2.0")
+        self.setWindowTitle("cURL (bash) → GET request converter v1.2.2")
         self.resize(self.COLLAPSED_W, self.COLLAPSED_H)
 
         # Guard flag to prevent infinite sync loops
@@ -536,8 +632,8 @@ class ConverterWindow(QWidget):
         req_label.setFont(QFont("Segoe UI", 14))
         req.addWidget(req_label)
 
-        self.request_url_input = QLineEdit()
-        self.request_url_input.setPlaceholderText("Base URL up to '?'")
+        self.request_url_input = ExpandableLineEdit()
+        self.request_url_input.setPlaceholderText("Base URL up to '?'  (double-click to expand)")
         self.request_url_input.textChanged.connect(self._on_request_url_changed)
         req.addWidget(self.request_url_input)
 
@@ -560,13 +656,41 @@ class ConverterWindow(QWidget):
         resp_label.setFont(QFont("Segoe UI", 14))
         resp.addWidget(resp_label)
 
-        # Status — read-only QLineEdit gives selection + ПКМ menu + Ctrl+C for free
+        # Status row: status_code | time | size. All read-only QLineEdit-s for
+        # selection + ПКМ Copy + Ctrl+C. Only status_label gets a colored bg.
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(8)
+
         self.status_label = QLineEdit("")
         self.status_label.setReadOnly(True)
         self.status_label.setFrame(False)
         self.status_label.setFont(QFont("Consolas", 10))
         self._apply_status_style(bg="transparent", color="#444")
-        resp.addWidget(self.status_label)
+        status_row.addWidget(self.status_label, 0)
+
+        self.status_time = QLineEdit("")
+        self.status_time.setReadOnly(True)
+        self.status_time.setFrame(False)
+        self.status_time.setFont(QFont("Consolas", 10))
+        self.status_time.setStyleSheet(
+            "QLineEdit { background: transparent; color: #444; "
+            "padding: 2px 6px; border: none; }"
+        )
+        status_row.addWidget(self.status_time, 0)
+
+        self.status_size = QLineEdit("")
+        self.status_size.setReadOnly(True)
+        self.status_size.setFrame(False)
+        self.status_size.setFont(QFont("Consolas", 10))
+        self.status_size.setStyleSheet(
+            "QLineEdit { background: transparent; color: #444; "
+            "padding: 2px 6px; border: none; }"
+        )
+        status_row.addWidget(self.status_size, 0)
+
+        status_row.addStretch(1)
+        resp.addLayout(status_row)
 
         self.response_box = JsonResponseEdit()
         resp.addWidget(self.response_box, 1)
@@ -645,8 +769,10 @@ class ConverterWindow(QWidget):
         # If the right panel is currently open, animate it closed and clear the
         # stale response. Next Send on the new URL will reopen it fresh.
         if self.right_panel.isVisible():
-            self.status_label.setText("")
+            self._set_status_field(self.status_label, "")
             self._apply_status_style(bg="transparent", color="#444")
+            self._set_status_field(self.status_time, "")
+            self._set_status_field(self.status_size, "")
             self.response_box.setPlainText("")
             self._animate_collapse()
 
@@ -668,8 +794,10 @@ class ConverterWindow(QWidget):
             self._animate_expand()
 
         # Indicate pending request
-        self.status_label.setText("Sending...")
+        self._set_status_field(self.status_label, "Sending...")
         self._apply_status_style(bg="transparent", color="#444")
+        self._set_status_field(self.status_time, "")
+        self._set_status_field(self.status_size, "")
         self.response_box.setPlainText("")
 
         # Detach any in-flight worker so its eventual completion doesn't
@@ -698,11 +826,13 @@ class ConverterWindow(QWidget):
         self._worker = worker
         thread.start()
 
-    def _on_response_received(self, code: int, reason: str, body: str):
-        text = f"Status code: {code} {reason}".rstrip()
-        self.status_label.setText(text)
+    def _on_response_received(self, code: int, reason: str, body: str,
+                              elapsed_ms: float, size_bytes: int):
+        self._set_status_field(self.status_label, f"Status code: {code} {reason}".rstrip())
+        self._set_status_field(self.status_time, self._format_time(elapsed_ms))
+        self._set_status_field(self.status_size, self._format_size(size_bytes))
 
-        # Background color by status class (2xx green / 4xx orange / etc.)
+        # Background color by status class (only status_label; time/size stay neutral)
         cls = code // 100
         bg = self.STATUS_COLORS.get(cls, "transparent")
         self._apply_status_style(bg=bg, color="black")
@@ -716,8 +846,10 @@ class ConverterWindow(QWidget):
 
         self.response_box.setPlainText(body)
 
-    def _on_request_failed(self, error: str):
-        self.status_label.setText(error)
+    def _on_request_failed(self, error: str, elapsed_ms: float):
+        self._set_status_field(self.status_label, error)
+        self._set_status_field(self.status_time, self._format_time(elapsed_ms))
+        self._set_status_field(self.status_size, "")
         self._apply_status_style(bg="transparent", color="#8b0000")
         self.response_box.setPlainText("")
 
@@ -727,6 +859,33 @@ class ConverterWindow(QWidget):
             f"QLineEdit {{ background: {bg}; color: {color}; "
             f"padding: 2px 6px; border: none; border-radius: 3px; }}"
         )
+
+    # ----- helpers for the status row -----
+
+    def _set_status_field(self, field: QLineEdit, text: str):
+        """Set text and shrink the field width to fit (so the 3 fields sit
+        compactly side by side, instead of expanding to fill the row)."""
+        field.setText(text)
+        if text:
+            fm = field.fontMetrics()
+            w = fm.horizontalAdvance(text) + 18  # padding + slack
+            field.setFixedWidth(max(w, 1))
+        else:
+            field.setFixedWidth(1)
+
+    @staticmethod
+    def _format_time(ms: float) -> str:
+        if ms >= 1000:
+            return f"Time: {ms / 1000:.2f} s"
+        return f"Time: {int(round(ms))} ms"
+
+    @staticmethod
+    def _format_size(n: int) -> str:
+        if n >= 1024 * 1024:
+            return f"Size: {n / 1024 / 1024:.2f} MB"
+        if n >= 1024:
+            return f"Size: {n / 1024:.2f} KB"
+        return f"Size: {n} B"
 
     # ============================================================
     # Window animation
