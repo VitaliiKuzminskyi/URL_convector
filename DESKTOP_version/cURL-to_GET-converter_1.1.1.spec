@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='cURL-to_GET-converter_1.1.1',
+    name='cURL-to_GET-converter_1.2.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
