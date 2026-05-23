@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+import uuid
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -47,36 +48,6 @@ def parse_url_encoded(body: str) -> dict:
     return dict(urllib.parse.parse_qsl(body, keep_blank_values=True))
 
 
-def parse_body(body: str) -> dict:
-    """Auto-detect body format: try multipart first, fall back to URL-encoded."""
-    params = parse_multipart(body)
-    if params:
-        return params
-    return parse_url_encoded(body)
-
-
-def convert_to_url(text: str) -> str:
-    text = text.strip()
-
-    url_match = re.search(r"curl '([^']+)'", text)
-    if not url_match:
-        raise ValueError("It's not cURL (bash) type URL.\n\nPaste cURL (bash) type URL from DevTools please.")
-
-    base_url = url_match.group(1)
-
-    data_match = re.search(r"--data-raw \$'(.*?)'", text, re.DOTALL)
-    if not data_match:
-        data_match = re.search(r"--data-raw '(.*?)'", text, re.DOTALL)
-
-    params = parse_body(data_match.group(1)) if data_match else {}
-    query = urllib.parse.urlencode(params)
-
-    if not query:
-        return base_url
-    separator = "&" if "?" in base_url else "?"
-    return f"{base_url}{separator}{query}"
-
-
 def split_url(url: str) -> tuple:
     """Split URL into (base_url_with_trailing_?, params_dict).
     base_url keeps trailing '?' if there were any params or the URL ended with '?'."""
@@ -95,6 +66,162 @@ def build_url(base: str, params: dict) -> str:
         return base
     query = urllib.parse.urlencode(params)
     return f"{base}?{query}"
+
+
+# ============================================================
+# cURL request detection (v1.3.0)
+# ============================================================
+
+class ParsedRequest:
+    """Result of analysing a copied cURL (bash) command.
+
+    method        -- "GET" or "POST"
+    content_type  -- clean MIME type for display (no boundary), or "" if absent
+    body_format   -- "url-encoded" | "multipart" | "json" | "binary" | "none"
+    base_url      -- the URL taken from the curl command (may include a query)
+    params        -- dict of key/value pairs (only for url-encoded / multipart)
+    body_text     -- raw request body (only for json / binary)
+    """
+
+    def __init__(self, method="GET", content_type="", body_format="none",
+                 base_url="", params=None, body_text=""):
+        self.method = method
+        self.content_type = content_type
+        self.body_format = body_format
+        self.base_url = base_url
+        self.params = params or {}
+        self.body_text = body_text
+
+
+# curl body options, ordered so the more specific ones are tried first
+_BODY_OPTS = ("--data-raw", "--data-binary", "--data-ascii",
+              "--data-urlencode", "--data", "-d")
+
+
+def extract_body(text: str):
+    """Pull the request body out of a cURL command.
+    Handles both ANSI-C quoted ($'...') and plain ('...') forms."""
+    for opt in _BODY_OPTS:
+        esc = re.escape(opt)
+        m = re.search(esc + r" \$'(.*?)'", text, re.DOTALL)
+        if m:
+            return m.group(1)
+        m = re.search(esc + r" '(.*?)'", text, re.DOTALL)
+        if m:
+            return m.group(1)
+    return None
+
+
+def extract_content_type(text: str) -> str:
+    """Read the Content-Type header from a cURL command.
+    Returns a clean MIME type (parameters such as boundary/charset stripped)."""
+    m = re.search(r"-H '[Cc]ontent-[Tt]ype:\s*([^']+)'", text)
+    if not m:
+        return ""
+    return m.group(1).split(";")[0].strip()
+
+
+def detect_request(text: str) -> ParsedRequest:
+    """Analyse a copied cURL (bash) command and return a ParsedRequest."""
+    text = text.strip()
+
+    url_match = re.search(r"curl '([^']+)'", text)
+    if not url_match:
+        raise ValueError(
+            "It's not cURL (bash) type URL.\n\n"
+            "Paste cURL (bash) type URL from DevTools please."
+        )
+    base_url = url_match.group(1)
+
+    content_type = extract_content_type(text)
+    body = extract_body(text)
+
+    # --- method ---
+    method = "POST" if body is not None else "GET"
+    if re.search(r"(-X|--request)\s+'?POST'?", text):
+        method = "POST"
+    if body is None and re.search(r"(-X|--request)\s+'?GET'?", text):
+        method = "GET"
+
+    # --- body format ---
+    ct_low = content_type.lower()
+    if body is None:
+        body_format = "none"
+    elif "json" in ct_low:
+        body_format = "json"
+    elif "multipart" in ct_low:
+        body_format = "multipart"
+    elif "x-www-form-urlencoded" in ct_low:
+        body_format = "url-encoded"
+    else:
+        # No (or unhelpful) Content-Type: guess from the body shape
+        stripped = body.lstrip()
+        if stripped[:1] in ("{", "["):
+            body_format = "json"
+        elif 'name="' in body and ("\\r\\n" in body or "------" in body):
+            body_format = "multipart"
+        elif re.match(r"[^=&\s]+=", body):
+            body_format = "url-encoded"
+        else:
+            body_format = "binary"
+
+    # --- params / body text ---
+    params = {}
+    body_text = ""
+    if body_format == "url-encoded":
+        params = parse_url_encoded(body)
+    elif body_format == "multipart":
+        params = parse_multipart(body)
+        if not params:
+            # multipart that we couldn't parse — keep the raw body instead
+            body_format = "binary"
+            body_text = body
+    elif body_format in ("json", "binary"):
+        body_text = body
+
+    return ParsedRequest(
+        method=method,
+        content_type=content_type,
+        body_format=body_format,
+        base_url=base_url,
+        params=params,
+        body_text=body_text,
+    )
+
+
+def build_converted_url(pr: ParsedRequest) -> str:
+    """Build the 'Converted URL' for a parsed request.
+    For form-style bodies the params are appended as a query string (same as
+    v1.2.x), so the URL/params triangle keeps working. For json/binary the
+    body is not part of the URL, so just the base URL is returned."""
+    if pr.body_format in ("json", "binary") or not pr.params:
+        return pr.base_url
+    separator = "&" if "?" in pr.base_url else "?"
+    return f"{pr.base_url}{separator}{urllib.parse.urlencode(pr.params)}"
+
+
+def build_multipart_body(params: dict):
+    """Reconstruct a multipart/form-data body from a dict.
+    Returns (body_bytes, content_type_with_boundary)."""
+    boundary = "----CurlConverterBoundary" + uuid.uuid4().hex
+    lines = []
+    for key, value in params.items():
+        lines.append("--" + boundary)
+        lines.append(f'Content-Disposition: form-data; name="{key}"')
+        lines.append("")
+        lines.append(value)
+    lines.append("--" + boundary + "--")
+    lines.append("")
+    body = "\r\n".join(lines).encode("utf-8")
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def pretty_json(text: str) -> str:
+    """Pretty-print a JSON string; return the original text if it isn't JSON."""
+    try:
+        return json.dumps(json.loads(text), indent=4, ensure_ascii=False)
+    except (json.JSONDecodeError, ValueError):
+        return text
 
 
 # ============================================================
@@ -451,14 +578,28 @@ class ParamsTable(QTableWidget):
         super().keyPressEvent(event)
 
 
+class JsonBodyEdit(QPlainTextEdit):
+    """Editable monospace text editor for a JSON / raw request body.
+    Used instead of the key/value table when the request body is not a
+    set of form fields. Long lines are NOT wrapped (horizontal scroll),
+    keeping pretty-printed JSON readable."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFont(QFont("Consolas", 10))
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setPlaceholderText("Request body (JSON / raw) — editable.")
+
+
 # ============================================================
 # HTTP worker (background thread)
 # ============================================================
 
 class HttpWorker(QObject):
-    """Performs HTTP GET in a background thread, emits result via signals.
-    Always emits exactly one of `finished` or `failed`, even on unexpected errors.
-    Reports elapsed_ms and size_bytes alongside the response for UI display."""
+    """Performs an HTTP request (GET or POST) in a background thread and emits
+    the result via signals. Always emits exactly one of `finished` or `failed`,
+    even on unexpected errors. Reports elapsed_ms and size_bytes for UI display."""
 
     # code, reason, body, elapsed_ms, size_bytes
     finished = Signal(int, str, str, float, int)
@@ -467,14 +608,23 @@ class HttpWorker(QObject):
 
     REQUEST_TIMEOUT_SEC = 10
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, method: str = "GET",
+                 data: bytes = None, content_type: str = None):
         super().__init__()
         self.url = url
+        self.method = method
+        self.data = data
+        self.content_type = content_type
 
     def run(self):
         t0 = time.monotonic()
         try:
-            req = urllib.request.Request(self.url, method="GET")
+            headers = {}
+            if self.content_type:
+                headers["Content-Type"] = self.content_type
+            req = urllib.request.Request(
+                self.url, data=self.data, method=self.method, headers=headers
+            )
             try:
                 with urllib.request.urlopen(req, timeout=self.REQUEST_TIMEOUT_SEC) as resp:
                     status = int(resp.status)
@@ -531,13 +681,25 @@ class ConverterWindow(QWidget):
         5: "#ffc0c0",   # 5xx — red
     }
 
+    # Request type indicator colors
+    METHOD_GET_BG = "#C8F0C8"        # GET — green
+    METHOD_POST_BG = "#D8DA8E"       # POST — yellow
+    CTYPE_JSON_BG = "#B5D4FF"        # JSON content-type — blue
+    CTYPE_GET_OTHER_BG = "#DEF6DE"   # other content-type on GET — light green
+    CTYPE_POST_OTHER_BG = "#E8E9BB"  # other content-type on POST — light yellow
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("cURL (bash) → GET request converter v1.2.2")
+        self.setWindowTitle("cURL (bash) → request converter v1.3.0")
         self.resize(self.COLLAPSED_W, self.COLLAPSED_H)
 
         # Guard flag to prevent infinite sync loops
         self._syncing = False
+
+        # Last detected request (set by Convert); drives Send + the indicator
+        self._parsed = None
+        # True when the body is shown as a JSON/raw text editor instead of a table
+        self._json_mode = False
 
         # HTTP worker references
         self._thread = None
@@ -574,7 +736,7 @@ class ConverterWindow(QWidget):
         self.input_box.setAcceptRichText(False)
         left.addWidget(self.input_box)
 
-        convert_btn = QPushButton("Convert to GET request")
+        convert_btn = QPushButton("Convert from cURL (bash) type to request")
         convert_btn.setStyleSheet(
             "QPushButton { background-color: #a3ffb5; padding: 6px; }"
             "QPushButton:hover { background-color: #85e89a; }"
@@ -596,7 +758,7 @@ class ConverterWindow(QWidget):
 
         btn_row = QHBoxLayout()
 
-        copy_btn = QPushButton("Copy GET request")
+        copy_btn = QPushButton("Copy request")
         copy_btn.setStyleSheet(
             "QPushButton { background-color: #f0f2af; padding: 6px; }"
             "QPushButton:hover { background-color: #d8da8e; }"
@@ -605,7 +767,7 @@ class ConverterWindow(QWidget):
         copy_btn.clicked.connect(self.copy_result)
         btn_row.addWidget(copy_btn, 1)
 
-        send_btn = QPushButton("Send GET request")
+        send_btn = QPushButton("Send request")
         send_btn.setStyleSheet(
             "QPushButton { background-color: #b5d4ff; padding: 6px; }"
             "QPushButton:hover { background-color: #9ec0ed; }"
@@ -632,6 +794,27 @@ class ConverterWindow(QWidget):
         req_label.setFont(QFont("Segoe UI", 14))
         req.addWidget(req_label)
 
+        # Request type indicator: method + (optional) content-type.
+        # Both are selectable + copyable (Ctrl+C / right-click Copy).
+        indicator_row = QHBoxLayout()
+        indicator_row.setContentsMargins(0, 0, 0, 2)
+        indicator_row.setSpacing(6)
+
+        self.method_label = QLabel("")
+        self.method_label.setFont(QFont("Consolas", 10))
+        self.method_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.method_label.setVisible(False)
+        indicator_row.addWidget(self.method_label, 0)
+
+        self.ctype_label = QLabel("")
+        self.ctype_label.setFont(QFont("Consolas", 10))
+        self.ctype_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.ctype_label.setVisible(False)
+        indicator_row.addWidget(self.ctype_label, 0)
+
+        indicator_row.addStretch(1)
+        req.addLayout(indicator_row)
+
         self.request_url_input = ExpandableLineEdit()
         self.request_url_input.setPlaceholderText("Base URL up to '?'  (double-click to expand)")
         self.request_url_input.textChanged.connect(self._on_request_url_changed)
@@ -641,9 +824,15 @@ class ConverterWindow(QWidget):
         params_label.setFont(QFont("Segoe UI", 14))
         req.addWidget(params_label)
 
+        # Form-style body — key/value table (default)
         self.params_table = ParamsTable()
         self.params_table.itemChanged.connect(self._on_params_changed)
         req.addWidget(self.params_table, 1)
+
+        # JSON / raw body — text editor (shown instead of the table when needed)
+        self.json_editor = JsonBodyEdit()
+        self.json_editor.setVisible(False)
+        req.addWidget(self.json_editor, 1)
 
         right.addWidget(req_widget, 1)
 
@@ -748,6 +937,52 @@ class ConverterWindow(QWidget):
             self._syncing = False
 
     # ============================================================
+    # Request type indicator
+    # ============================================================
+
+    def _set_json_mode(self, on: bool):
+        """Toggle the request-body editor between the key/value table (form
+        bodies) and the JSON/raw text editor."""
+        self._json_mode = on
+        self.params_table.setVisible(not on)
+        self.json_editor.setVisible(on)
+
+    def _update_indicator(self):
+        """Refresh the method / content-type indicator from self._parsed."""
+        pr = self._parsed
+        if pr is None:
+            self.method_label.setVisible(False)
+            self.ctype_label.setVisible(False)
+            return
+
+        # --- method ---
+        if pr.method == "POST":
+            m_bg = self.METHOD_POST_BG
+        else:
+            m_bg = self.METHOD_GET_BG
+        self.method_label.setText(pr.method)
+        self.method_label.setStyleSheet(
+            f"QLabel {{ background: {m_bg}; padding: 2px 8px; border-radius: 3px; }}"
+        )
+        self.method_label.setVisible(True)
+
+        # --- content-type (only if present in the request) ---
+        if pr.content_type:
+            if "json" in pr.content_type.lower():
+                c_bg = self.CTYPE_JSON_BG
+            elif pr.method == "POST":
+                c_bg = self.CTYPE_POST_OTHER_BG
+            else:
+                c_bg = self.CTYPE_GET_OTHER_BG
+            self.ctype_label.setText(pr.content_type)
+            self.ctype_label.setStyleSheet(
+                f"QLabel {{ background: {c_bg}; padding: 2px 8px; border-radius: 3px; }}"
+            )
+            self.ctype_label.setVisible(True)
+        else:
+            self.ctype_label.setVisible(False)
+
+    # ============================================================
     # Actions
     # ============================================================
 
@@ -756,8 +991,7 @@ class ConverterWindow(QWidget):
 
     def on_convert(self):
         try:
-            result = convert_to_url(self.input_box.toPlainText())
-            self.output_box.setPlainText(result)
+            pr = detect_request(self.input_box.toPlainText())
         except Exception as e:
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Icon.Critical)
@@ -766,8 +1000,23 @@ class ConverterWindow(QWidget):
             msg.exec()
             return
 
+        self._parsed = pr
+
+        if pr.body_format in ("json", "binary"):
+            # JSON / raw body — show the text editor, body is not part of the URL
+            self._set_json_mode(True)
+            self.json_editor.setPlainText(pretty_json(pr.body_text))
+            self.output_box.setPlainText(build_converted_url(pr))
+        else:
+            # GET or form-style body — key/value table, params live in the URL
+            self._set_json_mode(False)
+            self.json_editor.setPlainText("")
+            self.output_box.setPlainText(build_converted_url(pr))
+
+        self._update_indicator()
+
         # If the right panel is currently open, animate it closed and clear the
-        # stale response. Next Send on the new URL will reopen it fresh.
+        # stale response. Next Send on the new request will reopen it fresh.
         if self.right_panel.isVisible():
             self._set_status_field(self.status_label, "")
             self._apply_status_style(bg="transparent", color="#444")
@@ -783,7 +1032,33 @@ class ConverterWindow(QWidget):
         QApplication.clipboard().setText(self.response_box.toPlainText())
 
     def on_send(self):
-        url = self.output_box.toPlainText().strip()
+        # Decide method / body from the last Convert (self._parsed).
+        pr = self._parsed
+        method = "GET"
+        data = None
+        content_type = None
+
+        if pr is not None and pr.method == "POST":
+            method = "POST"
+            base = self.request_url_input.text().strip().rstrip("?")
+            if self._json_mode:
+                # JSON / raw — body comes straight from the text editor
+                url = self.output_box.toPlainText().strip()
+                data = self.json_editor.toPlainText().encode("utf-8")
+                content_type = pr.content_type or "application/json"
+            elif pr.body_format == "multipart":
+                # Rebuild a fresh multipart body from the current table
+                url = base
+                data, content_type = build_multipart_body(self.params_table.read())
+            else:
+                # url-encoded form body
+                url = base
+                data = urllib.parse.urlencode(self.params_table.read()).encode("utf-8")
+                content_type = pr.content_type or "application/x-www-form-urlencoded"
+        else:
+            # GET (detected, or no Convert performed yet) — send the Converted URL
+            url = self.output_box.toPlainText().strip()
+
         if not url:
             QMessageBox.warning(self, "Send", "Converted URL is empty.\nPaste cURL and click Convert first.")
             return
@@ -811,7 +1086,7 @@ class ConverterWindow(QWidget):
 
         # Fresh thread + worker; cleanup chain through deleteLater (no parent).
         thread = QThread()
-        worker = HttpWorker(url)
+        worker = HttpWorker(url, method, data, content_type)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
