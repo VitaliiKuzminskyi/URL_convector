@@ -12,12 +12,15 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QTextEdit, QPushButton, QMessageBox,
     QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView,
-    QStyledItemDelegate, QPlainTextEdit,
+    QStyledItemDelegate, QPlainTextEdit, QTabWidget, QTabBar, QInputDialog, QMenu,
 )
-from PySide6.QtGui import QFont, QIcon, QPixmap, QMovie, QPainter, QColor, QKeySequence, QTextOption
+from PySide6.QtGui import (
+    QFont, QIcon, QPixmap, QMovie, QPainter, QColor, QKeySequence,
+    QTextOption, QTextCursor, QPen,
+)
 from PySide6.QtCore import (
     Qt, Signal, QObject, QThread, QTimer,
-    QRect, QPropertyAnimation, QEasingCurve,
+    QRect, QSize, QPropertyAnimation, QEasingCurve,
 )
 
 
@@ -66,6 +69,33 @@ def build_url(base: str, params: dict) -> str:
         return base
     query = urllib.parse.urlencode(params)
     return f"{base}?{query}"
+
+
+def tab_title_from_url(url: str) -> str:
+    """Derive a short tab title from a URL — its host name, or a fallback."""
+    url = (url or "").strip()
+    if not url:
+        return "New tab"
+    try:
+        netloc = urllib.parse.urlparse(url).netloc
+    except Exception:
+        netloc = ""
+    if netloc:
+        # drop any credentials and the port
+        netloc = netloc.split("@")[-1].split(":")[0]
+        if netloc:
+            return netloc
+    return "New tab"
+
+
+def url_without_params(url: str) -> str:
+    """Return the URL up to and including the question mark.
+    If there is no query, the URL is returned unchanged."""
+    url = (url or "").strip()
+    q = url.find("?")
+    if q >= 0:
+        return url[:q + 1]
+    return url
 
 
 # ============================================================
@@ -333,6 +363,9 @@ class ExpandableLineEdit(QPlainTextEdit):
 
     def focusOutEvent(self, event):
         self._collapse()
+        # scroll back to the start of the URL so its beginning is visible,
+        # not wherever the caret happened to be while editing
+        self.moveCursor(QTextCursor.MoveOperation.Start)
         super().focusOutEvent(event)
 
     def keyPressEvent(self, event):
@@ -660,18 +693,19 @@ class HttpWorker(QObject):
 
 
 # ============================================================
-# Main window
+# Converter page — one independent request (one tab)
 # ============================================================
 
-class ConverterWindow(QWidget):
+class ConverterPage(QWidget):
+    """A single, fully independent cURL -> request converter.
+    One ConverterPage lives in each tab and owns its own state, HTTP worker
+    and response. It emits:
+      - requestSent : when Send is pressed (the window expands on the first one)
+      - urlChanged  : when the converted URL changes (title + tooltip)
+    """
 
-    # Window size targets
-    COLLAPSED_W = 600
-    COLLAPSED_H = 500
-    EXPANDED_W = 1320
-    EXPANDED_H = 640
-    SCREEN_FILL_RATIO = 0.85
-    ANIM_DURATION_MS = 100
+    requestSent = Signal()
+    urlChanged = Signal(str)
 
     # Status code background palette
     STATUS_COLORS = {
@@ -690,8 +724,6 @@ class ConverterWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("cURL (bash) → request converter v1.3.0")
-        self.resize(self.COLLAPSED_W, self.COLLAPSED_H)
 
         # Guard flag to prevent infinite sync loops
         self._syncing = False
@@ -704,9 +736,6 @@ class ConverterWindow(QWidget):
         # HTTP worker references
         self._thread = None
         self._worker = None
-
-        # Geometry animation
-        self._anim = None
 
         # ===== ROOT LAYOUT =====
         root = QHBoxLayout(self)
@@ -911,6 +940,8 @@ class ConverterWindow(QWidget):
             base, params = split_url(url)
             self.request_url_input.setText(base)
             self.params_table.fill(params)
+            # let the window refresh this tab's title + tooltip
+            self.urlChanged.emit(url)
         finally:
             self._syncing = False
 
@@ -986,8 +1017,19 @@ class ConverterWindow(QWidget):
     # Actions
     # ============================================================
 
+    def copy_state_from(self, other):
+        """Copy another page's request into this one (used by Duplicate Tab).
+        The raw cURL (bash) input is intentionally NOT copied — only the
+        converted request: URL, params, detected method and JSON body."""
+        self._parsed = other._parsed
+        self._set_json_mode(other._json_mode)
+        self.json_editor.setPlainText(other.json_editor.toPlainText())
+        # setting the Converted URL triggers the sync (Request URL + params)
+        self.output_box.setPlainText(other.output_box.toPlainText())
+        self._update_indicator()
+
     def show_instructions(self):
-        GifOverlay(resource_path("resources/info.gif"), self)
+        GifOverlay(resource_path("resources/info.gif"), self.window())
 
     def on_convert(self):
         try:
@@ -1015,15 +1057,15 @@ class ConverterWindow(QWidget):
 
         self._update_indicator()
 
-        # If the right panel is currently open, animate it closed and clear the
-        # stale response. Next Send on the new request will reopen it fresh.
+        # A fresh conversion = a new request: hide the (now stale) response panel.
+        # It reappears on the next Send. The window itself stays as-is.
         if self.right_panel.isVisible():
             self._set_status_field(self.status_label, "")
             self._apply_status_style(bg="transparent", color="#444")
             self._set_status_field(self.status_time, "")
             self._set_status_field(self.status_size, "")
             self.response_box.setPlainText("")
-            self._animate_collapse()
+            self.right_panel.setVisible(False)
 
     def copy_result(self):
         QApplication.clipboard().setText(self.output_box.toPlainText())
@@ -1063,10 +1105,10 @@ class ConverterWindow(QWidget):
             QMessageBox.warning(self, "Send", "Converted URL is empty.\nPaste cURL and click Convert first.")
             return
 
-        # Open right panel with a smooth animation if it isn't already visible
+        # Show this page's right panel and ask the window to expand (first time).
         if not self.right_panel.isVisible():
             self.right_panel.setVisible(True)
-            self._animate_expand()
+        self.requestSent.emit()
 
         # Indicate pending request
         self._set_status_field(self.status_label, "Sending...")
@@ -1119,14 +1161,19 @@ class ConverterWindow(QWidget):
         except (json.JSONDecodeError, ValueError):
             pass  # leave as plain text
 
+        # JSON / plain text — no wrap (horizontal scroll), unlike error text
+        self.response_box.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self.response_box.setPlainText(body)
 
     def _on_request_failed(self, error: str, elapsed_ms: float):
-        self._set_status_field(self.status_label, error)
+        # Keep the status field short so a long error cannot widen the
+        # panel; the full error text goes into the word-wrapped response box.
+        self._set_status_field(self.status_label, "Error")
         self._set_status_field(self.status_time, self._format_time(elapsed_ms))
         self._set_status_field(self.status_size, "")
         self._apply_status_style(bg="transparent", color="#8b0000")
-        self.response_box.setPlainText("")
+        self.response_box.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.response_box.setPlainText(error)
 
     def _apply_status_style(self, bg: str, color: str):
         """Apply background + text color to the status field via stylesheet."""
@@ -1162,9 +1209,352 @@ class ConverterWindow(QWidget):
             return f"Size: {n / 1024:.2f} KB"
         return f"Size: {n} B"
 
+
+# ============================================================
+# Tab bar — two-line tabs with an inline description editor
+# ============================================================
+
+class PlusButton(QPushButton):
+    """Small square button that paints a perfectly centred '+' glyph itself,
+    so the symbol is always dead-centre regardless of font metrics."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setText("")
+
+    def paintEvent(self, event):
+        super().paintEvent(event)  # button background / border / hover
+        painter = QPainter(self)
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0
+        arm = 5
+        pen = QPen(QColor("#333333"))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.drawLine(round(cx - arm), round(cy), round(cx + arm), round(cy))
+        painter.drawLine(round(cx), round(cy - arm), round(cx), round(cy + arm))
+        painter.end()
+
+
+class RequestTabBar(QTabBar):
+    """Custom tab bar with a single FIXED height (never changes):
+      - tabText (set by the window) is the request host;
+      - an optional description (stored in tabData) is shown as a compact
+        line above the host — both fit inside the fixed height;
+      - double-click a tab to edit its description inline;
+      - a '+' button sits right after the last tab;
+      - the active tab is painted lighter (#F5F5F5) than the inactive ones.
+    """
+
+    newTabRequested = Signal()
+    duplicateTabRequested = Signal(int)
+    closeTabRequested = Signal(int)
+
+    TAB_H = 46            # fixed tab / tab-bar height — never changes
+    MIN_TAB_W = 90        # tabs shrink down to this when many are open
+    MAX_TAB_W = 240       # preferred tab width when there is room
+    PLUS_SPACE = 42       # width kept free at the right for the "+" button
+    BG_BAR = "#ECECEC"
+    BG_ACTIVE = "#F5F5F5"
+    BG_INACTIVE = "#DEDEDE"
+    BORDER = "#BFBFBF"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # initialise these first — Qt may call tabLayoutChange() during the
+        # setExpanding / setDrawBase calls below, before the button exists
+        self._plus = None
+        self._editor = None
+        self._editing_index = -1
+
+        self.setExpanding(False)
+        self.setDrawBase(False)
+
+        # "+" new-tab button — a child of the bar, kept just after the last tab
+        self._plus = PlusButton(self)
+        self._plus.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._plus.setFixedSize(28, 24)
+        self._plus.setToolTip("New tab")
+        self._plus.setStyleSheet(
+            "QPushButton { border: 1px solid #bfbfbf; border-radius: 4px;"
+            " background: #e6e6e6; }"
+            "QPushButton:hover { background: #d4d4d4; }"
+        )
+        self._plus.clicked.connect(lambda: self.newTabRequested.emit())
+
+    # ----- sizing — ONE fixed height, always -----
+
+    def tabSizeHint(self, index: int) -> QSize:
+        # Browser-style: tabs share the available width and shrink as more
+        # are opened (down to MIN_TAB_W), so the '+' button stays reachable.
+        n = max(self.count(), 1)
+        avail = max(self.width() - self.PLUS_SPACE, self.MIN_TAB_W)
+        w = max(self.MIN_TAB_W, min(self.MAX_TAB_W, avail // n))
+        return QSize(w, self.TAB_H)
+
+    def minimumTabSizeHint(self, index: int) -> QSize:
+        return QSize(90, self.TAB_H)
+
+    def sizeHint(self) -> QSize:
+        # pin the bar height so it can never grow / multiply on relayout
+        return QSize(super().sizeHint().width(), self.TAB_H)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(super().minimumSizeHint().width(), self.TAB_H)
+
+    # ----- painting -----
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(self.BG_BAR))
+        fm = self.fontMetrics()
+
+        for i in range(self.count()):
+            rect = self.tabRect(i)
+            if not rect.isValid():
+                continue
+            selected = (i == self.currentIndex())
+            painter.fillRect(rect, QColor(self.BG_ACTIVE if selected else self.BG_INACTIVE))
+            painter.setPen(QColor(self.BORDER))
+            painter.drawRect(rect.adjusted(0, 0, -1, -1))
+
+            auto = self.tabText(i) or "New tab"
+            desc = self.tabData(i) or ""
+            # leave room on the left, and on the right for the close button
+            text_rect = rect.adjusted(10, 2, -26, -2)
+            two_line = bool(desc) or (i == self._editing_index)
+
+            if two_line:
+                half = text_rect.height() // 2
+                top = QRect(text_rect.x(), text_rect.y(), text_rect.width(), half)
+                bot = QRect(text_rect.x(), text_rect.y() + half,
+                            text_rect.width(), text_rect.height() - half)
+                # description (top) — hidden while it is being edited
+                if i != self._editing_index:
+                    painter.setPen(QColor("#1f1f1f"))
+                    painter.drawText(
+                        top, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                        fm.elidedText(desc, Qt.TextElideMode.ElideRight, top.width()),
+                    )
+                # request host (bottom) — slightly muted
+                painter.setPen(QColor("#5a5a5a"))
+                painter.drawText(
+                    bot, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    fm.elidedText(auto, Qt.TextElideMode.ElideRight, bot.width()),
+                )
+            else:
+                painter.setPen(QColor("#1f1f1f"))
+                painter.drawText(
+                    text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    fm.elidedText(auto, Qt.TextElideMode.ElideRight, text_rect.width()),
+                )
+        painter.end()
+
+    # ----- '+' button placement -----
+
+    def tabLayoutChange(self):
+        super().tabLayoutChange()
+        self._reposition_plus()
+
+    def tabInserted(self, index):
+        super().tabInserted(index)
+        self._reposition_plus()
+
+    def tabRemoved(self, index):
+        super().tabRemoved(index)
+        if self._editor is not None:
+            self._commit_edit()
+        self._reposition_plus()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reposition_plus()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._reposition_plus()
+
+    def _reposition_plus(self):
+        if self._plus is None:
+            return
+        if self.count() > 0:
+            last = self.tabRect(self.count() - 1)
+            x = last.right() + 6
+        else:
+            x = 6
+        # vertically centre the button in the tab bar
+        y = (self.height() - self._plus.height()) // 2
+        # never let the button slide off the right edge of the bar
+        x = max(4, min(x, self.width() - self._plus.width() - 4))
+        self._plus.move(x, max(0, y))
+        self._plus.raise_()
+
+    # ----- right-click context menu -----
+
+    def contextMenuEvent(self, event):
+        index = self.tabAt(event.pos())
+        if index < 0:
+            return
+        menu = QMenu(self)
+        act_dup = menu.addAction("Duplicate Tab")
+        act_close = menu.addAction("Close Tab")
+        chosen = menu.exec(event.globalPos())
+        if chosen is act_dup:
+            self.duplicateTabRequested.emit(index)
+        elif chosen is act_close:
+            self.closeTabRequested.emit(index)
+
+    # ----- inline description editing -----
+
+    def mouseDoubleClickEvent(self, event):
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        index = self.tabAt(pos)
+        if index < 0:
+            super().mouseDoubleClickEvent(event)
+            return
+        self._begin_edit(index)
+
+    def _begin_edit(self, index: int):
+        self._commit_edit()  # finish any previous edit first
+        self.setCurrentIndex(index)
+        self._editing_index = index
+
+        editor = QLineEdit(self)
+        editor.setText(self.tabData(index) or "")
+        editor.setPlaceholderText("description")
+        editor.setStyleSheet(
+            "QLineEdit { border: 1px solid #888; border-radius: 3px;"
+            " background: #ffffff; padding: 0px 4px; }"
+        )
+        editor.editingFinished.connect(self._commit_edit)
+        self._editor = editor
+
+        # the tab height is fixed, so the editor can be placed straight away
+        rect = self.tabRect(index)
+        half = rect.height() // 2
+        m = 3
+        editor.setGeometry(
+            rect.x() + m, rect.y() + m,
+            max(rect.width() - 2 * m - 22, 40), max(half - m + 2, 16),
+        )
+        editor.show()
+        editor.setFocus()
+        editor.selectAll()
+        self.update()
+
+    def _commit_edit(self):
+        if self._editor is None:
+            return
+        editor = self._editor
+        index = self._editing_index
+        self._editor = None
+        self._editing_index = -1
+        desc = editor.text().strip()
+        editor.deleteLater()
+        if 0 <= index < self.count():
+            self.setTabData(index, desc)
+        self.update()
+        self._reposition_plus()
+
+
+# ============================================================
+# Main window — a tab strip of independent converter pages
+# ============================================================
+
+class ConverterWindow(QWidget):
+
+    # Window size targets
+    COLLAPSED_W = 600
+    COLLAPSED_H = 540
+    EXPANDED_W = 1320
+    EXPANDED_H = 700
+    SCREEN_FILL_RATIO = 0.85
+    ANIM_DURATION_MS = 100
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("cURL (bash) → request converter v1.4.0")
+        self.resize(self.COLLAPSED_W, self.COLLAPSED_H)
+
+        # Geometry animation — the window expands once, on the first Send
+        self._anim = None
+        self._expanded = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        self.tabs = QTabWidget()
+        self._tabbar = RequestTabBar()
+        self.tabs.setTabBar(self._tabbar)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabCloseRequested.connect(self._close_tab)
+        self._tabbar.newTabRequested.connect(self._add_tab)
+        self._tabbar.duplicateTabRequested.connect(self._duplicate_tab)
+        self._tabbar.closeTabRequested.connect(self._close_tab)
+        layout.addWidget(self.tabs)
+
+        # Start with one empty tab
+        self._add_tab()
+
     # ============================================================
-    # Window animation
+    # Tab management
     # ============================================================
+
+    def _add_tab(self):
+        page = ConverterPage()
+        page.requestSent.connect(self._expand)
+        page.urlChanged.connect(lambda url, p=page: self._on_page_url(p, url))
+        index = self.tabs.addTab(page, "New tab")
+        self.tabs.setCurrentIndex(index)
+        return page
+
+    def _close_tab(self, index):
+        page = self.tabs.widget(index)
+        self.tabs.removeTab(index)
+        if page is not None:
+            page.deleteLater()
+        # Always keep at least one tab open
+        if self.tabs.count() == 0:
+            self._add_tab()
+
+    def _duplicate_tab(self, index):
+        src = self.tabs.widget(index)
+        if src is None:
+            return
+        page = ConverterPage()
+        page.requestSent.connect(self._expand)
+        page.urlChanged.connect(lambda url, p=page: self._on_page_url(p, url))
+        new_index = index + 1
+        self.tabs.insertTab(new_index, page, "New tab")
+        page.copy_state_from(src)
+        # carry the description (top line) over to the duplicate
+        desc = self._tabbar.tabData(index)
+        if desc:
+            self._tabbar.setTabData(new_index, desc)
+        self.tabs.setCurrentIndex(new_index)
+
+    def _on_page_url(self, page, url):
+        # Refresh this tab's auto-title (host) and its hover tooltip (url to '?').
+        index = self.tabs.indexOf(page)
+        if index < 0:
+            return
+        self.tabs.setTabText(index, tab_title_from_url(url))
+        self.tabs.setTabToolTip(index, url_without_params(url))
+        self._tabbar.updateGeometry()
+        self._tabbar.update()
+
+    # ============================================================
+    # Window expand animation (one-way: expands on the first Send)
+    # ============================================================
+
+    def _expand(self):
+        if self._expanded:
+            return
+        self._expanded = True
+        self._animate_geometry(self._target_expanded_geometry())
 
     def _target_expanded_geometry(self) -> QRect:
         screen = self.screen() or QApplication.primaryScreen()
@@ -1175,16 +1565,7 @@ class ConverterWindow(QWidget):
         y = sg.y() + (sg.height() - h) // 2
         return QRect(x, y, w, h)
 
-    def _target_collapsed_geometry(self) -> QRect:
-        screen = self.screen() or QApplication.primaryScreen()
-        sg = screen.availableGeometry()
-        w = self.COLLAPSED_W
-        h = self.COLLAPSED_H
-        x = sg.x() + (sg.width() - w) // 2
-        y = sg.y() + (sg.height() - h) // 2
-        return QRect(x, y, w, h)
-
-    def _animate_geometry(self, target: QRect, on_finished=None):
+    def _animate_geometry(self, target: QRect):
         """Animate the window geometry to `target` over ANIM_DURATION_MS.
         Cancels any in-flight animation first."""
         if self._anim is not None:
@@ -1200,19 +1581,7 @@ class ConverterWindow(QWidget):
         self._anim.setStartValue(self.geometry())
         self._anim.setEndValue(target)
         self._anim.setEasingCurve(QEasingCurve.Type.Linear)
-        if on_finished is not None:
-            self._anim.finished.connect(on_finished)
         self._anim.start()
-
-    def _animate_expand(self):
-        self._animate_geometry(self._target_expanded_geometry())
-
-    def _animate_collapse(self):
-        # Hide right_panel only after the window has finished shrinking,
-        # otherwise the layout would briefly squish the left column.
-        def _hide_panel():
-            self.right_panel.setVisible(False)
-        self._animate_geometry(self._target_collapsed_geometry(), on_finished=_hide_panel)
 
 
 if __name__ == "__main__":
