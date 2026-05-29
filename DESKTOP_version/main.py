@@ -99,6 +99,21 @@ def url_without_params(url: str) -> str:
 
 
 # ============================================================
+# Session persistence (v1.5.0) — remember tabs between launches
+# ============================================================
+
+def _session_file_path() -> str:
+    """Return the path to the session.json file in the user app-data dir."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "URL_Converter", "session.json")
+
+
+# ============================================================
 # cURL request detection (v1.3.0)
 # ============================================================
 
@@ -114,13 +129,14 @@ class ParsedRequest:
     """
 
     def __init__(self, method="GET", content_type="", body_format="none",
-                 base_url="", params=None, body_text=""):
+                 base_url="", params=None, body_text="", headers=None):
         self.method = method
         self.content_type = content_type
         self.body_format = body_format
         self.base_url = base_url
         self.params = params or {}
         self.body_text = body_text
+        self.headers = headers or {}
 
 
 # curl body options, ordered so the more specific ones are tried first
@@ -151,6 +167,28 @@ def extract_content_type(text: str) -> str:
     return m.group(1).split(";")[0].strip()
 
 
+# headers that must NOT be forwarded as-is — we set them ourselves, urllib
+# manages them, or forwarding them would break the response (compressed body)
+_SKIP_HEADERS = {"content-type", "content-length", "host",
+                 "accept-encoding", "connection"}
+
+
+def extract_headers(text: str) -> dict:
+    """Collect every -H 'Name: Value' header from a cURL command.
+    Headers in _SKIP_HEADERS are dropped (set by us / managed by urllib)."""
+    headers = {}
+    for m in re.finditer(r"-H '([^']*)'", text):
+        raw = m.group(1)
+        if ":" not in raw:
+            continue
+        name, value = raw.split(":", 1)
+        name = name.strip()
+        value = value.strip()
+        if name and name.lower() not in _SKIP_HEADERS:
+            headers[name] = value
+    return headers
+
+
 def detect_request(text: str) -> ParsedRequest:
     """Analyse a copied cURL (bash) command and return a ParsedRequest."""
     text = text.strip()
@@ -164,6 +202,7 @@ def detect_request(text: str) -> ParsedRequest:
     base_url = url_match.group(1)
 
     content_type = extract_content_type(text)
+    headers = extract_headers(text)
     body = extract_body(text)
 
     # --- method ---
@@ -216,6 +255,7 @@ def detect_request(text: str) -> ParsedRequest:
         base_url=base_url,
         params=params,
         body_text=body_text,
+        headers=headers,
     )
 
 
@@ -642,17 +682,18 @@ class HttpWorker(QObject):
     REQUEST_TIMEOUT_SEC = 10
 
     def __init__(self, url: str, method: str = "GET",
-                 data: bytes = None, content_type: str = None):
+                 data: bytes = None, content_type: str = None, headers: dict = None):
         super().__init__()
         self.url = url
         self.method = method
         self.data = data
         self.content_type = content_type
+        self.headers = headers or {}
 
     def run(self):
         t0 = time.monotonic()
         try:
-            headers = {}
+            headers = dict(self.headers)
             if self.content_type:
                 headers["Content-Type"] = self.content_type
             req = urllib.request.Request(
@@ -874,8 +915,6 @@ class ConverterPage(QWidget):
         resp_label.setFont(QFont("Segoe UI", 14))
         resp.addWidget(resp_label)
 
-        # Status row: status_code | time | size. All read-only QLineEdit-s for
-        # selection + ПКМ Copy + Ctrl+C. Only status_label gets a colored bg.
         status_row = QHBoxLayout()
         status_row.setContentsMargins(0, 0, 0, 0)
         status_row.setSpacing(8)
@@ -986,7 +1025,6 @@ class ConverterPage(QWidget):
             self.ctype_label.setVisible(False)
             return
 
-        # --- method ---
         if pr.method == "POST":
             m_bg = self.METHOD_POST_BG
         else:
@@ -997,7 +1035,6 @@ class ConverterPage(QWidget):
         )
         self.method_label.setVisible(True)
 
-        # --- content-type (only if present in the request) ---
         if pr.content_type:
             if "json" in pr.content_type.lower():
                 c_bg = self.CTYPE_JSON_BG
@@ -1045,20 +1082,16 @@ class ConverterPage(QWidget):
         self._parsed = pr
 
         if pr.body_format in ("json", "binary"):
-            # JSON / raw body — show the text editor, body is not part of the URL
             self._set_json_mode(True)
             self.json_editor.setPlainText(pretty_json(pr.body_text))
             self.output_box.setPlainText(build_converted_url(pr))
         else:
-            # GET or form-style body — key/value table, params live in the URL
             self._set_json_mode(False)
             self.json_editor.setPlainText("")
             self.output_box.setPlainText(build_converted_url(pr))
 
         self._update_indicator()
 
-        # A fresh conversion = a new request: hide the (now stale) response panel.
-        # It reappears on the next Send. The window itself stays as-is.
         if self.right_panel.isVisible():
             self._set_status_field(self.status_label, "")
             self._apply_status_style(bg="transparent", color="#444")
@@ -1074,51 +1107,43 @@ class ConverterPage(QWidget):
         QApplication.clipboard().setText(self.response_box.toPlainText())
 
     def on_send(self):
-        # Decide method / body from the last Convert (self._parsed).
         pr = self._parsed
         method = "GET"
         data = None
         content_type = None
+        headers = pr.headers if pr is not None else {}
 
         if pr is not None and pr.method == "POST":
             method = "POST"
             base = self.request_url_input.text().strip().rstrip("?")
             if self._json_mode:
-                # JSON / raw — body comes straight from the text editor
                 url = self.output_box.toPlainText().strip()
                 data = self.json_editor.toPlainText().encode("utf-8")
                 content_type = pr.content_type or "application/json"
             elif pr.body_format == "multipart":
-                # Rebuild a fresh multipart body from the current table
                 url = base
                 data, content_type = build_multipart_body(self.params_table.read())
             else:
-                # url-encoded form body
                 url = base
                 data = urllib.parse.urlencode(self.params_table.read()).encode("utf-8")
                 content_type = pr.content_type or "application/x-www-form-urlencoded"
         else:
-            # GET (detected, or no Convert performed yet) — send the Converted URL
             url = self.output_box.toPlainText().strip()
 
         if not url:
             QMessageBox.warning(self, "Send", "Converted URL is empty.\nPaste cURL and click Convert first.")
             return
 
-        # Show this page's right panel and ask the window to expand (first time).
         if not self.right_panel.isVisible():
             self.right_panel.setVisible(True)
         self.requestSent.emit()
 
-        # Indicate pending request
         self._set_status_field(self.status_label, "Sending...")
         self._apply_status_style(bg="transparent", color="#444")
         self._set_status_field(self.status_time, "")
         self._set_status_field(self.status_size, "")
         self.response_box.setPlainText("")
 
-        # Detach any in-flight worker so its eventual completion doesn't
-        # overwrite the fresh state we're about to set up.
         if self._worker is not None:
             try:
                 self._worker.finished.disconnect()
@@ -1126,9 +1151,8 @@ class ConverterPage(QWidget):
             except (RuntimeError, TypeError):
                 pass
 
-        # Fresh thread + worker; cleanup chain through deleteLater (no parent).
         thread = QThread()
-        worker = HttpWorker(url, method, data, content_type)
+        worker = HttpWorker(url, method, data, content_type, headers)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -1149,17 +1173,15 @@ class ConverterPage(QWidget):
         self._set_status_field(self.status_time, self._format_time(elapsed_ms))
         self._set_status_field(self.status_size, self._format_size(size_bytes))
 
-        # Background color by status class (only status_label; time/size stay neutral)
         cls = code // 100
         bg = self.STATUS_COLORS.get(cls, "transparent")
         self._apply_status_style(bg=bg, color="black")
 
-        # Pretty-print JSON if possible
         try:
             parsed = json.loads(body)
             body = json.dumps(parsed, indent=4, ensure_ascii=False)
         except (json.JSONDecodeError, ValueError):
-            pass  # leave as plain text
+            pass
 
         # JSON / plain text — no wrap (horizontal scroll), unlike error text
         self.response_box.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
@@ -1176,21 +1198,16 @@ class ConverterPage(QWidget):
         self.response_box.setPlainText(error)
 
     def _apply_status_style(self, bg: str, color: str):
-        """Apply background + text color to the status field via stylesheet."""
         self.status_label.setStyleSheet(
             f"QLineEdit {{ background: {bg}; color: {color}; "
             f"padding: 2px 6px; border: none; border-radius: 3px; }}"
         )
 
-    # ----- helpers for the status row -----
-
     def _set_status_field(self, field: QLineEdit, text: str):
-        """Set text and shrink the field width to fit (so the 3 fields sit
-        compactly side by side, instead of expanding to fill the row)."""
         field.setText(text)
         if text:
             fm = field.fontMetrics()
-            w = fm.horizontalAdvance(text) + 18  # padding + slack
+            w = fm.horizontalAdvance(text) + 18
             field.setFixedWidth(max(w, 1))
         else:
             field.setFixedWidth(1)
@@ -1208,6 +1225,54 @@ class ConverterPage(QWidget):
         if n >= 1024:
             return f"Size: {n / 1024:.2f} KB"
         return f"Size: {n} B"
+
+    # ============================================================
+    # Session persistence (v1.5.0)
+    # ============================================================
+
+    def to_dict(self) -> dict:
+        """Serialise this page request state to a JSON-safe dict.
+        cURL input, response and status fields are intentionally NOT saved."""
+        pr = self._parsed
+        return {
+            "output_text": self.output_box.toPlainText(),
+            "json_text": self.json_editor.toPlainText(),
+            "json_mode": self._json_mode,
+            "parsed": None if pr is None else {
+                "method": pr.method,
+                "content_type": pr.content_type,
+                "body_format": pr.body_format,
+                "base_url": pr.base_url,
+                "params": pr.params,
+                "body_text": pr.body_text,
+                "headers": pr.headers,
+            },
+        }
+
+    def from_dict(self, data: dict) -> None:
+        """Restore this page from a dict produced by to_dict()."""
+        pd = data.get("parsed")
+        if pd:
+            self._parsed = ParsedRequest(
+                method=pd.get("method", "GET"),
+                content_type=pd.get("content_type", ""),
+                body_format=pd.get("body_format", "none"),
+                base_url=pd.get("base_url", ""),
+                params=pd.get("params", {}),
+                body_text=pd.get("body_text", ""),
+                headers=pd.get("headers", {}),
+            )
+        else:
+            self._parsed = None
+        self._set_json_mode(bool(data.get("json_mode", False)))
+        self.json_editor.setPlainText(data.get("json_text", ""))
+        # setting the Converted URL triggers the sync (Request URL + params)
+        self.output_box.setPlainText(data.get("output_text", ""))
+        self._update_indicator()
+        # Show the right panel right away so the restored request is visible
+        # without having to click Send first.
+        if self._parsed is not None or self.output_box.toPlainText().strip():
+            self.right_panel.setVisible(True)
 
 
 # ============================================================
@@ -1267,6 +1332,10 @@ class RequestTabBar(QTabBar):
         self._plus = None
         self._editor = None
         self._editing_index = -1
+        self._dragging = False
+        self._press_on_tab = False
+        self._grab_dx = 0
+        self._drag_mouse_x = 0
 
         self.setExpanding(False)
         self.setDrawBase(False)
@@ -1308,48 +1377,89 @@ class RequestTabBar(QTabBar):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(self.BG_BAR))
-        fm = self.fontMetrics()
 
+        # the tab being dragged is painted last so it floats above the rest
+        dragged = self.currentIndex() if self._dragging else -1
         for i in range(self.count()):
-            rect = self.tabRect(i)
-            if not rect.isValid():
+            if i == dragged:
                 continue
-            selected = (i == self.currentIndex())
-            painter.fillRect(rect, QColor(self.BG_ACTIVE if selected else self.BG_INACTIVE))
-            painter.setPen(QColor(self.BORDER))
-            painter.drawRect(rect.adjusted(0, 0, -1, -1))
+            rect = self.tabRect(i)
+            if rect.isValid():
+                self._draw_tab(painter, i, rect)
 
-            auto = self.tabText(i) or "New tab"
-            desc = self.tabData(i) or ""
-            # leave room on the left, and on the right for the close button
-            text_rect = rect.adjusted(10, 2, -26, -2)
-            two_line = bool(desc) or (i == self._editing_index)
+        if dragged >= 0:
+            base = self.tabRect(dragged)
+            if base.isValid():
+                x = self._drag_mouse_x - self._grab_dx
+                x = max(0, min(x, self.width() - base.width()))
+                self._draw_tab(painter, dragged,
+                               QRect(x, base.y(), base.width(), base.height()))
+        painter.end()
 
-            if two_line:
-                half = text_rect.height() // 2
-                top = QRect(text_rect.x(), text_rect.y(), text_rect.width(), half)
-                bot = QRect(text_rect.x(), text_rect.y() + half,
-                            text_rect.width(), text_rect.height() - half)
-                # description (top) — hidden while it is being edited
-                if i != self._editing_index:
-                    painter.setPen(QColor("#1f1f1f"))
-                    painter.drawText(
-                        top, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                        fm.elidedText(desc, Qt.TextElideMode.ElideRight, top.width()),
-                    )
-                # request host (bottom) — slightly muted
-                painter.setPen(QColor("#5a5a5a"))
-                painter.drawText(
-                    bot, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                    fm.elidedText(auto, Qt.TextElideMode.ElideRight, bot.width()),
-                )
-            else:
+    def _draw_tab(self, painter, i, rect):
+        fm = self.fontMetrics()
+        selected = (i == self.currentIndex())
+        painter.fillRect(rect, QColor(self.BG_ACTIVE if selected else self.BG_INACTIVE))
+        painter.setPen(QColor(self.BORDER))
+        painter.drawRect(rect.adjusted(0, 0, -1, -1))
+
+        auto = self.tabText(i) or "New tab"
+        desc = self.tabData(i) or ""
+        # leave room on the left, and on the right for the close button
+        text_rect = rect.adjusted(10, 2, -26, -2)
+        two_line = bool(desc) or (i == self._editing_index)
+
+        if two_line:
+            half = text_rect.height() // 2
+            top = QRect(text_rect.x(), text_rect.y(), text_rect.width(), half)
+            bot = QRect(text_rect.x(), text_rect.y() + half,
+                        text_rect.width(), text_rect.height() - half)
+            # description (top) — hidden while it is being edited
+            if i != self._editing_index:
                 painter.setPen(QColor("#1f1f1f"))
                 painter.drawText(
-                    text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                    fm.elidedText(auto, Qt.TextElideMode.ElideRight, text_rect.width()),
+                    top, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    fm.elidedText(desc, Qt.TextElideMode.ElideRight, top.width()),
                 )
-        painter.end()
+            # request host (bottom) — slightly muted
+            painter.setPen(QColor("#5a5a5a"))
+            painter.drawText(
+                bot, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                fm.elidedText(auto, Qt.TextElideMode.ElideRight, bot.width()),
+            )
+        else:
+            painter.setPen(QColor("#1f1f1f"))
+            painter.drawText(
+                text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                fm.elidedText(auto, Qt.TextElideMode.ElideRight, text_rect.width()),
+            )
+
+    # ----- drag — let the dragged tab follow the cursor -----
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        self._dragging = False
+        self._press_on_tab = False
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            idx = self.tabAt(pos)
+            if idx >= 0:
+                self._press_on_tab = True
+                self._grab_dx = pos.x() - self.tabRect(idx).x()
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        if self._press_on_tab and (event.buttons() & Qt.MouseButton.LeftButton):
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            self._drag_mouse_x = pos.x()
+            self._dragging = True
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self._dragging:
+            self._dragging = False
+            self.update()
 
     # ----- '+' button placement -----
 
@@ -1474,7 +1584,7 @@ class ConverterWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("cURL (bash) → request converter v1.4.0")
+        self.setWindowTitle("cURL (bash) → request converter v1.5.0")
         self.resize(self.COLLAPSED_W, self.COLLAPSED_H)
 
         # Geometry animation — the window expands once, on the first Send
@@ -1496,8 +1606,9 @@ class ConverterWindow(QWidget):
         self._tabbar.closeTabRequested.connect(self._close_tab)
         layout.addWidget(self.tabs)
 
-        # Start with one empty tab
-        self._add_tab()
+        # Start with one empty tab — or restore the previous session.
+        if not self._try_load_session():
+            self._add_tab()
 
     # ============================================================
     # Tab management
@@ -1582,6 +1693,80 @@ class ConverterWindow(QWidget):
         self._anim.setEndValue(target)
         self._anim.setEasingCurve(QEasingCurve.Type.Linear)
         self._anim.start()
+
+    # ============================================================
+    # Session persistence (v1.5.0)
+    # ============================================================
+
+    def closeEvent(self, event):
+        self._save_session()
+        super().closeEvent(event)
+
+    def _save_session(self) -> None:
+        tabs_data = []
+        for i in range(self.tabs.count()):
+            page = self.tabs.widget(i)
+            if page is None:
+                continue
+            d = page.to_dict()
+            desc = self._tabbar.tabData(i)
+            if desc:
+                d["description"] = desc
+            tabs_data.append(d)
+        data = {
+            "version": 1,
+            "tabs": tabs_data,
+            "active_index": self.tabs.currentIndex(),
+        }
+        path = _session_file_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[session] save failed: {e}", file=sys.stderr)
+
+    def _try_load_session(self) -> bool:
+        """Restore tabs from the saved session. Returns True on success."""
+        path = _session_file_path()
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or data.get("version") != 1:
+                return False
+            tabs_data = data.get("tabs", [])
+            if not tabs_data:
+                return False
+            any_request = False
+            for td in tabs_data:
+                # Skip completely-empty tabs.
+                if not td.get("parsed") and not (td.get("output_text") or "").strip():
+                    continue
+                page = ConverterPage()
+                page.requestSent.connect(self._expand)
+                page.urlChanged.connect(lambda url, p=page: self._on_page_url(p, url))
+                self.tabs.addTab(page, "New tab")
+                page.from_dict(td)
+                desc = td.get("description") or ""
+                if desc:
+                    idx = self.tabs.indexOf(page)
+                    self._tabbar.setTabData(idx, desc)
+                if page._parsed is not None:
+                    any_request = True
+            if self.tabs.count() == 0:
+                return False
+            active = max(0, min(int(data.get("active_index", 0)), self.tabs.count() - 1))
+            self.tabs.setCurrentIndex(active)
+            # If any tab had a parsed request, expand the window now.
+            if any_request:
+                self._expanded = True
+                self.setGeometry(self._target_expanded_geometry())
+            return True
+        except Exception as e:
+            print(f"[session] load failed: {e}", file=sys.stderr)
+            return False
 
 
 if __name__ == "__main__":
