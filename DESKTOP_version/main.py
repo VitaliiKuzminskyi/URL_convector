@@ -534,6 +534,26 @@ class ParamsTable(QTableWidget):
         )
 
         self._expanded_row = -1
+        # v1.6.0 — per-cell theme backgrounds (set by apply_theme)
+        self._theme_key_bg = None
+        self._theme_val_bg = None
+
+    def apply_theme(self, palette: dict) -> None:
+        """Re-colour key/value cell backgrounds for the active theme."""
+        self._theme_key_bg = QColor(palette["key_bg"])
+        self._theme_val_bg = QColor(palette["input_bg"])
+        self._apply_item_theme_bg()
+
+    def _apply_item_theme_bg(self) -> None:
+        if self._theme_key_bg is None:
+            return
+        for r in range(self.rowCount()):
+            ki = self.item(r, 0)
+            vi = self.item(r, 1)
+            if ki is not None:
+                ki.setBackground(self._theme_key_bg)
+            if vi is not None:
+                vi.setBackground(self._theme_val_bg)
 
     def fill(self, params: dict):
         """Populate the table from a dict, resetting row heights and column widths."""
@@ -546,6 +566,7 @@ class ParamsTable(QTableWidget):
             self.setRowHeight(row, self.DEFAULT_ROW_HEIGHT)
         self._adjust_key_column_width()
         self._expanded_row = -1
+        self._apply_item_theme_bg()
 
     def read(self) -> dict:
         """Read the current table contents back into a dict (skips rows with empty key)."""
@@ -734,6 +755,133 @@ class HttpWorker(QObject):
 
 
 # ============================================================
+# Theme (v1.6.0) — Light / Dark palettes + global stylesheet
+# ============================================================
+
+THEMES = {
+    "light": {
+        "window_bg":    "#FFFFFF",
+        "border":       "#C8C8C8",
+        "input_bg":     "#FDFDFD",
+        "key_bg":       "#FAFAFA",
+        "scrollbar":    "#636363",
+        "label_text":   "#1F1F1F",
+        "field_text":   "#1F1F1F",
+        "version_text": "#888888",
+        "toggle_label": "Dark mode",
+        "toggle_bg":    "#292929",
+        "toggle_color": "#b89412",
+        # tab bar
+        "tab_bar_bg":      "#ECECEC",
+        "tab_active_bg":   "#F5F5F5",
+        "tab_inactive_bg": "#DEDEDE",
+        "tab_border":      "#BFBFBF",
+        "tab_text_desc":   "#1f1f1f",
+        "tab_text_host":   "#5a5a5a",
+        "tab_text_solo":   "#1f1f1f",
+        "plus_bg":         "#e6e6e6",
+        "plus_hover":      "#d4d4d4",
+        "plus_border":     "#bfbfbf",
+        "plus_color":      "#1f1f1f",
+        "tab_editor_bg":   "#ffffff",
+        "tab_editor_text": "#1f1f1f",
+        "tab_editor_brd":  "#888888",
+    },
+    "dark": {
+        "window_bg":    "#000000",
+        "border":       "#5e4c09",
+        "input_bg":     "#292929",
+        "key_bg":       "#292929",
+        "scrollbar":    "#705a0b",
+        "label_text":   "#b89412",
+        "field_text":   "#94770e",
+        "version_text": "#b89412",
+        "toggle_label": "Light mode",
+        "toggle_bg":    "#F5F5F5",
+        "toggle_color": "#292929",
+        # tab bar
+        "tab_bar_bg":      "#000000",
+        "tab_active_bg":   "#292929",
+        "tab_inactive_bg": "#1a1a1a",
+        "tab_border":      "#5e4c09",
+        "tab_text_desc":   "#b89412",
+        "tab_text_host":   "#94770e",
+        "tab_text_solo":   "#b89412",
+        "plus_bg":         "#292929",
+        "plus_hover":      "#3a3a3a",
+        "plus_border":     "#5e4c09",
+        "plus_color":      "#b89412",
+        "tab_editor_bg":   "#292929",
+        "tab_editor_text": "#b89412",
+        "tab_editor_brd":  "#5e4c09",
+    },
+}
+
+
+def build_theme_qss(name: str) -> str:
+    """Build the global QApplication stylesheet for the given theme."""
+    t = THEMES[name]
+    return (
+        "QWidget { background: " + t["window_bg"] + "; color: " + t["label_text"] + "; }\n"
+        "QTextEdit, QPlainTextEdit { background: " + t["input_bg"] + "; "
+        "color: " + t["field_text"] + "; border: 1px solid " + t["border"] + "; }\n"
+        "QTableWidget { background: " + t["input_bg"] + "; "
+        "color: " + t["field_text"] + "; gridline-color: " + t["border"] + "; "
+        "border: 1px solid " + t["border"] + "; }\n"
+        "QHeaderView::section { background: " + t["key_bg"] + "; "
+        "color: " + t["label_text"] + "; border: 1px solid " + t["border"] + "; padding: 4px; }\n"
+        "QScrollBar:vertical, QScrollBar:horizontal { "
+        "background: " + t["window_bg"] + "; border: 1px solid " + t["border"] + "; }\n"
+        "QScrollBar::handle:vertical, QScrollBar::handle:horizontal { "
+        "background: " + t["scrollbar"] + "; border-radius: 3px; }\n"
+        "QScrollBar::add-line, QScrollBar::sub-line { background: transparent; border: none; }\n"
+    )
+
+
+class ThemeButton(QPushButton):
+    """Compact pill-style button that toggles the application theme.
+    Always shows the action it will take (e.g. 'Dark mode' while in light)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFont(QFont("Consolas", 10))
+        self.clicked.connect(self._on_click)
+
+    def _on_click(self):
+        win = self.window()
+        if hasattr(win, "toggle_theme"):
+            win.toggle_theme()
+
+    def refresh(self):
+        win = self.window()
+        name = getattr(win, "_theme", "light")
+        t = THEMES[name]
+        self.setText(t["toggle_label"])
+        self.setStyleSheet(
+            "QPushButton { background: " + t["toggle_bg"] + "; "
+            "color: " + t["toggle_color"] + "; "
+            "border: none; border-radius: 3px; padding: 2px 10px; }"
+        )
+
+
+class VersionLabel(QLabel):
+    """Small 'v1.6.0 · Desktop edition' label next to the theme toggle."""
+
+    TEXT = "v1.6.0 · Desktop edition"
+
+    def __init__(self, parent=None):
+        super().__init__(self.TEXT, parent)
+        self.setFont(QFont("Consolas", 10))
+
+    def refresh(self):
+        win = self.window()
+        name = getattr(win, "_theme", "light")
+        t = THEMES[name]
+        self.setStyleSheet("color: " + t["version_text"] + "; background: transparent;")
+
+
+# ============================================================
 # Converter page — one independent request (one tab)
 # ============================================================
 
@@ -808,9 +956,9 @@ class ConverterPage(QWidget):
 
         convert_btn = QPushButton("Convert from cURL (bash) type to request")
         convert_btn.setStyleSheet(
-            "QPushButton { background-color: #a3ffb5; padding: 6px; }"
-            "QPushButton:hover { background-color: #85e89a; }"
-            "QPushButton:pressed { background-color: #63cc7a; }"
+            "QPushButton { background-color: #a3ffb5; color: #000000; padding: 6px; }"
+            "QPushButton:hover { background-color: #85e89a; color: #000000; }"
+            "QPushButton:pressed { background-color: #63cc7a; color: #000000; }"
         )
         convert_btn.clicked.connect(self.on_convert)
         left.addWidget(convert_btn)
@@ -830,23 +978,32 @@ class ConverterPage(QWidget):
 
         copy_btn = QPushButton("Copy request")
         copy_btn.setStyleSheet(
-            "QPushButton { background-color: #f0f2af; padding: 6px; }"
-            "QPushButton:hover { background-color: #d8da8e; }"
-            "QPushButton:pressed { background-color: #c0c270; }"
+            "QPushButton { background-color: #f0f2af; color: #000000; padding: 6px; }"
+            "QPushButton:hover { background-color: #d8da8e; color: #000000; }"
+            "QPushButton:pressed { background-color: #c0c270; color: #000000; }"
         )
         copy_btn.clicked.connect(self.copy_result)
         btn_row.addWidget(copy_btn, 1)
 
         send_btn = QPushButton("Send request")
         send_btn.setStyleSheet(
-            "QPushButton { background-color: #b5d4ff; padding: 6px; }"
-            "QPushButton:hover { background-color: #9ec0ed; }"
-            "QPushButton:pressed { background-color: #7fa6d4; }"
+            "QPushButton { background-color: #b5d4ff; color: #000000; padding: 6px; }"
+            "QPushButton:hover { background-color: #9ec0ed; color: #000000; }"
+            "QPushButton:pressed { background-color: #7fa6d4; color: #000000; }"
         )
         send_btn.clicked.connect(self.on_send)
         btn_row.addWidget(send_btn, 1)
 
         left.addLayout(btn_row)
+
+        # v1.6.0 — bottom row in the left column: theme toggle + version
+        bottom_left = QHBoxLayout()
+        bottom_left.addStretch(1)
+        self.theme_btn_left = ThemeButton()
+        self.version_label_left = VersionLabel()
+        bottom_left.addWidget(self.theme_btn_left, 0)
+        bottom_left.addWidget(self.version_label_left, 0)
+        left.addLayout(bottom_left)
 
         root.addWidget(left_widget, 1)
 
@@ -954,17 +1111,29 @@ class ConverterPage(QWidget):
 
         copy_resp_btn = QPushButton("Copy response")
         copy_resp_btn.setStyleSheet(
-            "QPushButton { background-color: #f5b8c8; padding: 6px; }"
-            "QPushButton:hover { background-color: #e09cae; }"
-            "QPushButton:pressed { background-color: #c78294; }"
+            "QPushButton { background-color: #f5b8c8; color: #000000; padding: 6px; }"
+            "QPushButton:hover { background-color: #e09cae; color: #000000; }"
+            "QPushButton:pressed { background-color: #c78294; color: #000000; }"
         )
         copy_resp_btn.clicked.connect(self.copy_response)
         resp.addWidget(copy_resp_btn)
+
+        # v1.6.0 — same controls in the right panel for the expanded state
+        bottom_right = QHBoxLayout()
+        bottom_right.addStretch(1)
+        self.theme_btn_right = ThemeButton()
+        self.version_label_right = VersionLabel()
+        bottom_right.addWidget(self.theme_btn_right, 0)
+        bottom_right.addWidget(self.version_label_right, 0)
+        resp.addLayout(bottom_right)
 
         right.addWidget(resp_widget, 1)
 
         self.right_panel.setVisible(False)
         root.addWidget(self.right_panel, 2)
+
+        # initial visibility for the toggle row (left set is shown by default)
+        self._sync_theme_btn_position()
 
     # ============================================================
     # Sync logic
@@ -1031,7 +1200,8 @@ class ConverterPage(QWidget):
             m_bg = self.METHOD_GET_BG
         self.method_label.setText(pr.method)
         self.method_label.setStyleSheet(
-            f"QLabel {{ background: {m_bg}; padding: 2px 8px; border-radius: 3px; }}"
+            f"QLabel {{ background: {m_bg}; color: #000000;"
+            f" padding: 2px 8px; border-radius: 3px; }}"
         )
         self.method_label.setVisible(True)
 
@@ -1044,7 +1214,8 @@ class ConverterPage(QWidget):
                 c_bg = self.CTYPE_GET_OTHER_BG
             self.ctype_label.setText(pr.content_type)
             self.ctype_label.setStyleSheet(
-                f"QLabel {{ background: {c_bg}; padding: 2px 8px; border-radius: 3px; }}"
+                f"QLabel {{ background: {c_bg}; color: #000000;"
+                f" padding: 2px 8px; border-radius: 3px; }}"
             )
             self.ctype_label.setVisible(True)
         else:
@@ -1099,6 +1270,7 @@ class ConverterPage(QWidget):
             self._set_status_field(self.status_size, "")
             self.response_box.setPlainText("")
             self.right_panel.setVisible(False)
+            self._sync_theme_btn_position()
 
     def copy_result(self):
         QApplication.clipboard().setText(self.output_box.toPlainText())
@@ -1136,6 +1308,7 @@ class ConverterPage(QWidget):
 
         if not self.right_panel.isVisible():
             self.right_panel.setVisible(True)
+            self._sync_theme_btn_position()
         self.requestSent.emit()
 
         self._set_status_field(self.status_label, "Sending...")
@@ -1212,6 +1385,30 @@ class ConverterPage(QWidget):
         else:
             field.setFixedWidth(1)
 
+    # ============================================================
+    # Theme (v1.6.0)
+    # ============================================================
+
+    def _sync_theme_btn_position(self):
+        """Toggle + version live in the LEFT column when the right panel is
+        hidden, and in the RIGHT panel when it is shown."""
+        open_panel = self.right_panel.isVisible()
+        self.theme_btn_left.setVisible(not open_panel)
+        self.version_label_left.setVisible(not open_panel)
+        self.theme_btn_right.setVisible(open_panel)
+        self.version_label_right.setVisible(open_panel)
+
+    def refresh_theme_ui(self):
+        """Re-style the toggle buttons + version labels for the current theme,
+        and re-colour the params table cells."""
+        self.theme_btn_left.refresh()
+        self.theme_btn_right.refresh()
+        self.version_label_left.refresh()
+        self.version_label_right.refresh()
+        win = self.window()
+        name = getattr(win, "_theme", "light")
+        self.params_table.apply_theme(THEMES[name])
+
     @staticmethod
     def _format_time(ms: float) -> str:
         if ms >= 1000:
@@ -1273,6 +1470,7 @@ class ConverterPage(QWidget):
         # without having to click Send first.
         if self._parsed is not None or self.output_box.toPlainText().strip():
             self.right_panel.setVisible(True)
+        self._sync_theme_btn_position()
 
 
 # ============================================================
@@ -1319,10 +1517,6 @@ class RequestTabBar(QTabBar):
     MIN_TAB_W = 90        # tabs shrink down to this when many are open
     MAX_TAB_W = 240       # preferred tab width when there is room
     PLUS_SPACE = 42       # width kept free at the right for the "+" button
-    BG_BAR = "#ECECEC"
-    BG_ACTIVE = "#F5F5F5"
-    BG_INACTIVE = "#DEDEDE"
-    BORDER = "#BFBFBF"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1336,6 +1530,8 @@ class RequestTabBar(QTabBar):
         self._press_on_tab = False
         self._grab_dx = 0
         self._drag_mouse_x = 0
+        # v1.6.0 — active palette (filled by apply_theme; default is light)
+        self._palette = THEMES["light"]
 
         self.setExpanding(False)
         self.setDrawBase(False)
@@ -1345,12 +1541,73 @@ class RequestTabBar(QTabBar):
         self._plus.setCursor(Qt.CursorShape.PointingHandCursor)
         self._plus.setFixedSize(28, 24)
         self._plus.setToolTip("New tab")
-        self._plus.setStyleSheet(
-            "QPushButton { border: 1px solid #bfbfbf; border-radius: 4px;"
-            " background: #e6e6e6; }"
-            "QPushButton:hover { background: #d4d4d4; }"
-        )
+        self._apply_plus_style()
         self._plus.clicked.connect(lambda: self.newTabRequested.emit())
+
+    # ----- v1.6.0 theming -----
+
+    def apply_theme(self, palette: dict) -> None:
+        """Switch the tab bar to a new colour palette and repaint."""
+        self._palette = palette
+        self._apply_plus_style()
+        # Tab-bar background only — close buttons are custom widgets we manage
+        # ourselves (see `_make_close_button`), so no QSS for them here.
+        self.setStyleSheet(
+            "QTabBar { background: " + palette["tab_bar_bg"] + "; border: none; }\n"
+        )
+        # restyle existing close buttons (theme might have changed)
+        for i in range(self.count()):
+            btn = self.tabButton(i, QTabBar.ButtonPosition.RightSide)
+            if isinstance(btn, QPushButton):
+                self._style_close_button(btn)
+        # if there's an inline editor open, re-style it too
+        if self._editor is not None:
+            self._editor.setStyleSheet(
+                "QLineEdit { border: 1px solid " + palette["tab_editor_brd"]
+                + "; border-radius: 3px;"
+                + " background: " + palette["tab_editor_bg"]
+                + "; color: " + palette["tab_editor_text"]
+                + "; padding: 0px 4px; }"
+            )
+        self.update()
+
+    def _make_close_button(self) -> QPushButton:
+        """Create a small flat '✕' button to attach to a tab via setTabButton."""
+        btn = QPushButton("✕", self)   # ✕
+        btn.setFlat(True)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedSize(16, 16)
+        btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._style_close_button(btn)
+        btn.clicked.connect(lambda _=False, b=btn: self._on_close_clicked(b))
+        return btn
+
+    def _style_close_button(self, btn: QPushButton) -> None:
+        p = self._palette
+        btn.setStyleSheet(
+            "QPushButton { border: none; background: transparent;"
+            " color: " + p["tab_text_solo"] + "; border-radius: 8px; padding: 0; }"
+            "QPushButton:hover { background: " + p["plus_hover"] + "; }"
+        )
+
+    def _on_close_clicked(self, btn: QPushButton) -> None:
+        for i in range(self.count()):
+            if self.tabButton(i, QTabBar.ButtonPosition.RightSide) is btn:
+                self.closeTabRequested.emit(i)
+                return
+
+    def _apply_plus_style(self) -> None:
+        p = self._palette
+        if self._plus is None:
+            return
+        self._plus.setStyleSheet(
+            "QPushButton { border: 1px solid " + p["plus_border"]
+            + "; border-radius: 4px;"
+            + " background: " + p["plus_bg"]
+            + "; color: " + p["plus_color"] + "; }"
+            "QPushButton:hover { background: " + p["plus_hover"] + "; }"
+        )
 
     # ----- sizing — ONE fixed height, always -----
 
@@ -1376,7 +1633,8 @@ class RequestTabBar(QTabBar):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(self.BG_BAR))
+        p = self._palette
+        painter.fillRect(self.rect(), QColor(p["tab_bar_bg"]))
 
         # the tab being dragged is painted last so it floats above the rest
         dragged = self.currentIndex() if self._dragging else -1
@@ -1398,9 +1656,13 @@ class RequestTabBar(QTabBar):
 
     def _draw_tab(self, painter, i, rect):
         fm = self.fontMetrics()
+        p = self._palette
         selected = (i == self.currentIndex())
-        painter.fillRect(rect, QColor(self.BG_ACTIVE if selected else self.BG_INACTIVE))
-        painter.setPen(QColor(self.BORDER))
+        painter.fillRect(
+            rect,
+            QColor(p["tab_active_bg"] if selected else p["tab_inactive_bg"]),
+        )
+        painter.setPen(QColor(p["tab_border"]))
         painter.drawRect(rect.adjusted(0, 0, -1, -1))
 
         auto = self.tabText(i) or "New tab"
@@ -1416,19 +1678,19 @@ class RequestTabBar(QTabBar):
                         text_rect.width(), text_rect.height() - half)
             # description (top) — hidden while it is being edited
             if i != self._editing_index:
-                painter.setPen(QColor("#1f1f1f"))
+                painter.setPen(QColor(p["tab_text_desc"]))
                 painter.drawText(
                     top, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                     fm.elidedText(desc, Qt.TextElideMode.ElideRight, top.width()),
                 )
             # request host (bottom) — slightly muted
-            painter.setPen(QColor("#5a5a5a"))
+            painter.setPen(QColor(p["tab_text_host"]))
             painter.drawText(
                 bot, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 fm.elidedText(auto, Qt.TextElideMode.ElideRight, bot.width()),
             )
         else:
-            painter.setPen(QColor("#1f1f1f"))
+            painter.setPen(QColor(p["tab_text_solo"]))
             painter.drawText(
                 text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 fm.elidedText(auto, Qt.TextElideMode.ElideRight, text_rect.width()),
@@ -1469,6 +1731,12 @@ class RequestTabBar(QTabBar):
 
     def tabInserted(self, index):
         super().tabInserted(index)
+        # v1.6.0 — attach our own '✕' close button (Qt's default close icon is
+        # unreliable on Windows; we want a guaranteed, themeable glyph).
+        if self.tabButton(index, QTabBar.ButtonPosition.RightSide) is None:
+            self.setTabButton(
+                index, QTabBar.ButtonPosition.RightSide, self._make_close_button()
+            )
         self._reposition_plus()
 
     def tabRemoved(self, index):
@@ -1533,9 +1801,13 @@ class RequestTabBar(QTabBar):
         editor = QLineEdit(self)
         editor.setText(self.tabData(index) or "")
         editor.setPlaceholderText("description")
+        p = self._palette
         editor.setStyleSheet(
-            "QLineEdit { border: 1px solid #888; border-radius: 3px;"
-            " background: #ffffff; padding: 0px 4px; }"
+            "QLineEdit { border: 1px solid " + p["tab_editor_brd"]
+            + "; border-radius: 3px;"
+            + " background: " + p["tab_editor_bg"]
+            + "; color: " + p["tab_editor_text"]
+            + "; padding: 0px 4px; }"
         )
         editor.editingFinished.connect(self._commit_edit)
         self._editor = editor
@@ -1584,12 +1856,15 @@ class ConverterWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("cURL (bash) → request converter v1.5.0")
+        self.setWindowTitle("cURL (bash) → request converter v1.6.0")
         self.resize(self.COLLAPSED_W, self.COLLAPSED_H)
 
         # Geometry animation — the window expands once, on the first Send
         self._anim = None
         self._expanded = False
+
+        # v1.6.0 — active theme: "light" | "dark"
+        self._theme = "light"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -1597,7 +1872,9 @@ class ConverterWindow(QWidget):
         self.tabs = QTabWidget()
         self._tabbar = RequestTabBar()
         self.tabs.setTabBar(self._tabbar)
-        self.tabs.setTabsClosable(True)
+        # v1.6.0 — Qt's native close icon is unreliable on Windows (only a dot
+        # on hover); we draw our own '✕' button via RequestTabBar.tabInserted.
+        self.tabs.setTabsClosable(False)
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
@@ -1610,6 +1887,9 @@ class ConverterWindow(QWidget):
         if not self._try_load_session():
             self._add_tab()
 
+        # v1.6.0 — apply theme to the whole window
+        self.apply_theme()
+
     # ============================================================
     # Tab management
     # ============================================================
@@ -1620,6 +1900,9 @@ class ConverterWindow(QWidget):
         page.urlChanged.connect(lambda url, p=page: self._on_page_url(p, url))
         index = self.tabs.addTab(page, "New tab")
         self.tabs.setCurrentIndex(index)
+        # v1.6.0 — paint the new page's theme toggle + version label
+        page.refresh_theme_ui()
+        page._sync_theme_btn_position()
         return page
 
     def _close_tab(self, index):
@@ -1646,6 +1929,9 @@ class ConverterWindow(QWidget):
         if desc:
             self._tabbar.setTabData(new_index, desc)
         self.tabs.setCurrentIndex(new_index)
+        # v1.6.0 — paint the duplicated page's theme toggle + version label
+        page.refresh_theme_ui()
+        page._sync_theme_btn_position()
 
     def _on_page_url(self, page, url):
         # Refresh this tab's auto-title (host) and its hover tooltip (url to '?').
@@ -1656,6 +1942,28 @@ class ConverterWindow(QWidget):
         self.tabs.setTabToolTip(index, url_without_params(url))
         self._tabbar.updateGeometry()
         self._tabbar.update()
+
+    # ============================================================
+    # Theme (v1.6.0)
+    # ============================================================
+
+    def toggle_theme(self) -> None:
+        self._theme = "dark" if self._theme == "light" else "light"
+        self.apply_theme()
+
+    def apply_theme(self) -> None:
+        qss = build_theme_qss(self._theme)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(qss)
+        # v1.6.0 — repaint the custom tab bar with the new palette
+        bar = self.tabs.tabBar()
+        if hasattr(bar, "apply_theme"):
+            bar.apply_theme(THEMES[self._theme])
+        for i in range(self.tabs.count()):
+            page = self.tabs.widget(i)
+            if hasattr(page, "refresh_theme_ui"):
+                page.refresh_theme_ui()
 
     # ============================================================
     # Window expand animation (one-way: expands on the first Send)
@@ -1717,6 +2025,7 @@ class ConverterWindow(QWidget):
             "version": 1,
             "tabs": tabs_data,
             "active_index": self.tabs.currentIndex(),
+            "theme": self._theme,
         }
         path = _session_file_path()
         try:
@@ -1736,6 +2045,11 @@ class ConverterWindow(QWidget):
                 data = json.load(f)
             if not isinstance(data, dict) or data.get("version") != 1:
                 return False
+            # v1.6.0 — restore the saved theme BEFORE creating pages,
+            # so the first apply_theme() at the end paints everything once.
+            saved_theme = data.get("theme")
+            if saved_theme in ("light", "dark"):
+                self._theme = saved_theme
             tabs_data = data.get("tabs", [])
             if not tabs_data:
                 return False

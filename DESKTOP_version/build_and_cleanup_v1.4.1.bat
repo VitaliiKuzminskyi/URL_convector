@@ -1,1 +1,0 @@
-@powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_and_cleanup_v1.4.1.ps1"
