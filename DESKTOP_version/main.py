@@ -602,9 +602,56 @@ class ParamsTable(QTableWidget):
             self.setItem(row, 0, QTableWidgetItem(key))
             self.setItem(row, 1, QTableWidgetItem(value))
             self.setRowHeight(row, self.DEFAULT_ROW_HEIGHT)
+        self._ensure_trailing_empty()   # v1.8.0 — always one empty row at end
         self._adjust_key_column_width()
         self._expanded_row = -1
         self._apply_item_theme_bg()
+
+    # v1.8.0 — trailing-empty-row maintenance
+    def _append_empty_row(self) -> None:
+        r = self.rowCount()
+        self.insertRow(r)
+        self.setItem(r, 0, QTableWidgetItem(""))
+        self.setItem(r, 1, QTableWidgetItem(""))
+        self.setRowHeight(r, self.DEFAULT_ROW_HEIGHT)
+        self._apply_item_theme_bg()
+
+    def _ensure_trailing_empty(self) -> None:
+        """Guarantee the bottom row of the table is empty (so the user always
+        has a place to type the next key/value)."""
+        last = self.rowCount() - 1
+        if last >= 0:
+            ki = self.item(last, 0)
+            vi = self.item(last, 1)
+            ke = (ki.text() if ki else "").strip()
+            ve = (vi.text() if vi else "")
+            if not ke and not ve:
+                return
+        self._append_empty_row()
+
+    def maintain_trailing_empty(self, item) -> None:
+        """Called by ConverterPage._on_params_changed (inside blockSignals).
+        - Typing in the last (trailing-empty) row promotes it and appends a
+          fresh empty row below.
+        - Clearing the key of a NON-last row removes that row entirely (the
+          user wanted to delete the param).
+        """
+        if item is None:
+            return
+        row = item.row()
+        last = self.rowCount() - 1
+        if row < 0 or row > last:
+            return
+        ki = self.item(row, 0)
+        vi = self.item(row, 1)
+        key_text = (ki.text() if ki else "").strip()
+        val_text = (vi.text() if vi else "")
+        if row == last and (key_text or val_text):
+            self._append_empty_row()
+            return
+        if row != last and not key_text:
+            self.removeRow(row)
+            return
 
     def read(self) -> dict:
         """Read the current table contents back into a dict (skips rows with empty key)."""
@@ -906,7 +953,7 @@ class ThemeButton(QPushButton):
 class VersionLabel(QLabel):
     """Small 'v1.6.0 · Desktop edition' label next to the theme toggle."""
 
-    TEXT = "v1.7.0 · Desktop edition"
+    TEXT = "v1.8.0 · Desktop edition"
 
     def __init__(self, parent=None):
         super().__init__(self.TEXT, parent)
@@ -1218,11 +1265,18 @@ class ConverterPage(QWidget):
         finally:
             self._syncing = False
 
-    def _on_params_changed(self, _item):
+    def _on_params_changed(self, item):
         if self._syncing:
             return
         self._syncing = True
         try:
+            # v1.8.0 — keep one empty row at the end; remove rows whose key the
+            # user cleared. Block signals so row mutations don't re-trigger us.
+            self.params_table.blockSignals(True)
+            try:
+                self.params_table.maintain_trailing_empty(item)
+            finally:
+                self.params_table.blockSignals(False)
             base = self.request_url_input.text()
             params = self.params_table.read()
             self.output_box.setPlainText(build_url(base, params))
@@ -1917,7 +1971,7 @@ class ConverterWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("cURL (bash) → request converter v1.7.0")
+        self.setWindowTitle("cURL (bash) → request converter v1.8.0")
         self.resize(self.COLLAPSED_W, self.COLLAPSED_H)
 
         # Geometry animation — the window expands once, on the first Send
