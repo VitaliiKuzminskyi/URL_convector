@@ -71,21 +71,59 @@ def build_url(base: str, params: dict) -> str:
     return f"{base}?{query}"
 
 
+# v1.7.0 — subdomains we recognise as an "environment" hint in tab titles
+_ENV_SUBDOMAINS = ("dev", "test")
+
+
 def tab_title_from_url(url: str) -> str:
-    """Derive a short tab title from a URL — its host name, or a fallback."""
+    """Derive a short tab title from a URL.
+
+    v1.7.0 — surface the endpoint instead of the full host:
+      * ``dev.specialdeals.g5e.com/v4/getContent?``       → ``dev.getContent``
+      * ``test.specialdeals.g5e.com/v4/getContent?``      → ``test.getContent``
+      * ``api.test.specialdeals.g5e.com/v4/getContent?``  → ``test.getContent``
+        (env is searched across all subdomain labels, not just the first)
+      * ``specialdeals.g5e.com/v4/getContent?``           → ``getContent``
+      * ``https://api.example.com/`` (no path)            → ``api.example.com``
+        (falls back to the host name, like v1.6.0 and earlier)
+    """
     url = (url or "").strip()
     if not url:
         return "New tab"
+    # urllib.parse needs a scheme to populate netloc; tack on a dummy if missing
+    parsed_input = url if "://" in url else "http://" + url
     try:
-        netloc = urllib.parse.urlparse(url).netloc
+        p = urllib.parse.urlparse(parsed_input)
     except Exception:
-        netloc = ""
-    if netloc:
-        # drop any credentials and the port
-        netloc = netloc.split("@")[-1].split(":")[0]
-        if netloc:
-            return netloc
-    return "New tab"
+        return "New tab"
+
+    # ---- host (strip credentials + port) ------------------------------------
+    netloc = p.netloc.split("@")[-1].split(":")[0]
+    if not netloc:
+        return "New tab"
+
+    # ---- endpoint = last non-empty path segment before '?' ------------------
+    path = (p.path or "").strip("/")
+    endpoint = ""
+    if path:
+        segs = [s for s in path.split("/") if s]
+        if segs:
+            endpoint = segs[-1]
+
+    # ---- env: search ALL subdomain labels (skip last two = domain + TLD) ---
+    labels = netloc.split(".")
+    env = ""
+    if len(labels) >= 3:
+        for lbl in labels[:-2]:
+            if lbl.lower() in _ENV_SUBDOMAINS:
+                env = lbl.lower()
+                break
+
+    # ---- assemble -----------------------------------------------------------
+    if endpoint:
+        return f"{env}.{endpoint}" if env else endpoint
+    # No path → keep the old behaviour (full hostname)
+    return netloc
 
 
 def url_without_params(url: str) -> str:
@@ -868,7 +906,7 @@ class ThemeButton(QPushButton):
 class VersionLabel(QLabel):
     """Small 'v1.6.0 · Desktop edition' label next to the theme toggle."""
 
-    TEXT = "v1.6.0 · Desktop edition"
+    TEXT = "v1.7.0 · Desktop edition"
 
     def __init__(self, parent=None):
         super().__init__(self.TEXT, parent)
@@ -954,6 +992,20 @@ class ConverterPage(QWidget):
         self.input_box.setAcceptRichText(False)
         left.addWidget(self.input_box)
 
+        # v1.7.0 — Clean | Convert row (1/3 : 2/3 widths, same row)
+        convert_row = QHBoxLayout()
+        convert_row.setContentsMargins(0, 0, 0, 0)
+        convert_row.setSpacing(6)
+
+        clean_btn = QPushButton("Clear cURL (bash) type field")
+        clean_btn.setStyleSheet(
+            "QPushButton { background-color: #f0f2af; color: #000000; padding: 6px; }"
+            "QPushButton:hover { background-color: #d8da8e; color: #000000; }"
+            "QPushButton:pressed { background-color: #c0c270; color: #000000; }"
+        )
+        clean_btn.clicked.connect(self.on_clean_input)
+        convert_row.addWidget(clean_btn, 1)   # 1/3 share
+
         convert_btn = QPushButton("Convert from cURL (bash) type to request")
         convert_btn.setStyleSheet(
             "QPushButton { background-color: #a3ffb5; color: #000000; padding: 6px; }"
@@ -961,7 +1013,9 @@ class ConverterPage(QWidget):
             "QPushButton:pressed { background-color: #63cc7a; color: #000000; }"
         )
         convert_btn.clicked.connect(self.on_convert)
-        left.addWidget(convert_btn)
+        convert_row.addWidget(convert_btn, 2)  # 2/3 share
+
+        left.addLayout(convert_row)
 
         output_title = QLabel("Converted URL")
         output_title.setFont(QFont("Segoe UI", 14))
@@ -1238,6 +1292,13 @@ class ConverterPage(QWidget):
 
     def show_instructions(self):
         GifOverlay(resource_path("resources/info.gif"), self.window())
+
+    def on_clean_input(self):
+        # v1.7.0 — Clean cURL (bash) type field button: empties the paste box
+        # only; doesn't touch Converted URL / Request / Response (those are
+        # cleared the normal way by pasting a new cURL + pressing Convert).
+        self.input_box.clear()
+        self.input_box.setFocus()
 
     def on_convert(self):
         try:
@@ -1856,7 +1917,7 @@ class ConverterWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("cURL (bash) → request converter v1.6.0")
+        self.setWindowTitle("cURL (bash) → request converter v1.7.0")
         self.resize(self.COLLAPSED_W, self.COLLAPSED_H)
 
         # Geometry animation — the window expands once, on the first Send
